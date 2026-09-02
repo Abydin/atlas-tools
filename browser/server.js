@@ -45,6 +45,22 @@ const BIND_IP = resolveBindIp();
 
 const browser = new AtlasBrowser();
 const browserReady = browser.launch({ headless: true });
+// FIRST-RUN FIX: launch() rejects with Playwright's own error (most often
+// "Executable doesn't exist ..." when `npx playwright install chromium`
+// was never run). Nothing awaits browserReady until the first request
+// comes in, so without this handler a launch failure that happens before
+// any request arrives is an unhandled rejection - Node dumps a raw stack
+// trace and the process dies with no clear next step, right after this
+// same process already printed "listening on ...", which reads as success.
+// Catching it here turns that into one loud, specific line and a clean
+// exit instead - install.sh and the top-level README both point back to
+// `npx playwright install chromium` as the fix.
+browserReady.catch((err) => {
+  console.error('atlas-browser: failed to launch the browser -', String((err && err.message) || err));
+  console.error('If that says "Executable doesn\'t exist", Chromium is not installed for Playwright.');
+  console.error('Fix: npx playwright install chromium   (or re-run ./install.sh)');
+  process.exit(1);
+});
 const escalations = new EscalationManager();
 
 // SECURITY (HOLE 3): bearer token required on every endpoint. Generated on
