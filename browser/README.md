@@ -49,10 +49,16 @@ cli.js  -->  HTTP (127.0.0.1)  -->  server.js  -->  lib/atlas-browser.js  -->  P
   surface an ordinary desktop Chrome instance would, without changing
   anything about the content submitted.
 - `lib/host-guard.js` / `lib/url-guard.js`: an SSRF guard. Denies
-  navigation **and subresource requests** to loopback/RFC1918/link-local/CGNAT
-  ranges by resolved IP (not a string check on the URL), so a hostile page
-  can't use this browser to reach an unauthenticated service on your own
-  machine or LAN.
+  navigation, subresource requests (fetch/XHR/images/etc.), and WebSocket
+  connections to loopback/RFC1918/link-local/CGNAT ranges by resolved IP
+  (not a string check on the URL), so a hostile page can't use this
+  browser to reach an unauthenticated service on your own machine or LAN.
+  RESIDUAL GAP: navigation alone gets a post-connect check against the
+  address Chromium actually used (`assertSafeServerAddress`), closing most
+  of the DNS-rebinding window between the guard's lookup and the real
+  connection; subresource requests and WebSocket connections only get the
+  pre-connect check, so that window stays open for them. See
+  `lib/host-guard.js`'s own RESIDUAL GAP comment for the full detail.
 - `lib/escalations.js` / `lib/ntfy.js` / `lib/scoped-tokens.js`: the
   handover path. When a session can't proceed, it raises an escalation and
   can send an optional push notification (via [ntfy](https://ntfy.sh)).
@@ -199,9 +205,15 @@ server/username/password values, the same as `storageState.json`/`token`.
   0600 file under `state/token`, never printed or logged - read it with
   `cat state/token` when you need it for `cli.js` or a manual request.
 - The browser's own destination-host guard (`lib/host-guard.js`) denies
-  top-level navigation and subresource requests to
+  top-level navigation, subresource requests, and WebSocket connections to
   loopback/RFC1918/link-local/CGNAT by resolved IP, not URL string, closing
-  the SSRF path a hostile page could otherwise use.
+  the SSRF path a hostile page could otherwise use. RESIDUAL GAP: only
+  navigation gets the post-connect `assertSafeServerAddress` check against
+  the address Chromium actually connected to; subresources and WebSockets
+  rely on the pre-connect resolved-IP check alone, so a DNS-rebinding
+  attacker with a very-low-TTL record could still slip one through in the
+  window between that check and the real connection. Not a claim this repo
+  papers over - see `lib/host-guard.js`'s RESIDUAL GAP comment.
 - `upload()` is confined to a single staging directory (`state/uploads/`);
   a path outside it is refused, not silently redirected.
 - `/live` and `/view` are token-gated at the server, and are meant to be
