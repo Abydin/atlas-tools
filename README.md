@@ -27,7 +27,7 @@ Each tool installs independently, see its own README for exact steps.
 Quick version:
 
 ```bash
-cd desktop && chmod +x desktop && ./desktop list-apps
+cd desktop && ./install.sh
 cd browser && npm install && npx playwright install chromium && ./start.sh
 cd fetch-media && ./install.sh
 ```

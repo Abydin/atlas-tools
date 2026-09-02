@@ -2,14 +2,7 @@
 
 A macOS desktop-control CLI. Reads any app's UI as structured data (roles,
 names, positions) via the Accessibility API and drives it by name, not by
-guessed pixel coordinates. Falls back to a screenshot + coordinate click
-only for the handful of things Accessibility genuinely can't see (canvas
-UIs, games, non-accessible legacy apps).
-
-One verb per invocation, JSON in, JSON out on stdout, non-zero exit with an
-`error` field on failure.
-
-## Why this exists
+guessed pixel coordinates.
 
 The usual way to script a macOS UI is "screenshot, eyeball pixels, click
 the coordinate." That's slow, breaks the moment a window moves or resizes,
@@ -17,7 +10,76 @@ and needs manual DPI math on anything but a plain 1x display. This CLI
 queries the OS's own accessibility tree instead, the same tree VoiceOver
 reads, so a query like "find the button named Submit" returns exact,
 click-ready coordinates without a human (or a model) ever looking at a
-screenshot.
+screenshot. A screenshot + coordinate click is still here, but only as a
+fallback for the handful of things Accessibility genuinely can't see
+(canvas UIs, games, non-accessible legacy apps).
+
+One verb per invocation, JSON in, JSON out on stdout, non-zero exit with an
+`error` field on failure.
+
+## Install
+
+```bash
+cd desktop
+./install.sh
+```
+
+`install.sh` checks for and installs `cliclick` (Homebrew) if it's
+missing, confirms `python3` is present, makes `desktop` executable, and
+probes whether Accessibility permission is actually granted to your
+terminal app, telling you the exact fix if it isn't. It's idempotent, safe
+to re-run.
+
+Nothing else needs installing: `desktop` is stdlib-only Python 3, and
+`_ax.js`/`_key.js` run under `osascript`'s own JavaScript engine, not
+Node. See [Why no package.json](#why-no-packagejson) below.
+
+**Accessibility permission is the one step a script can't do for you.**
+The first native-layer command triggers macOS's permission prompt; approve
+it once for whichever terminal app you're running from (System Settings >
+Privacy & Security > Accessibility). `install.sh` checks this and tells you
+if it's missing. Skip it and every native command still runs, prints valid
+JSON, and returns zero results with no error, the single worst first-run
+experience there is, so `desktop` itself also now detects the denial and
+returns a clear `error` field naming the fix instead of an empty result.
+
+## First command
+
+```bash
+$ ./desktop list-apps
+[{"name": "Finder", "bundleId": "com.apple.finder", "active": false, "pid": 412}, ...]
+```
+
+A JSON array of your currently running GUI apps. If Accessibility
+permission isn't granted yet, most commands (this one included, since it
+only needs `NSWorkspace`, not System Events) still work; the check below
+exercises the part that actually needs the permission.
+
+## Verify it works
+
+```bash
+./desktop windows
+```
+
+Success looks like a JSON array of the frontmost app's windows (title,
+role, position, size). This one actually touches System Events, so it's
+the real Accessibility-permission check. Failure looks like:
+
+```json
+{"error": "Accessibility permission is not granted to this terminal app. ...", "detail": "..."}
+```
+
+Grant it (System Settings > Privacy & Security > Accessibility, enable
+your terminal app) and re-run.
+
+**Example, click a button by name:**
+
+```bash
+$ ./desktop find --role button --name "Sign in" --app Safari
+[{"role": "button", "name": "Sign in", "x": 812, "y": 140, "w": 90, "h": 32, "cx": 857, "cy": 156}]
+$ ./desktop click --role button --name "Sign in" --app Safari
+{"clicked": true, "role": "button", "name": "Sign in"}
+```
 
 ## The three coverage layers
 
@@ -29,7 +91,7 @@ screenshot.
 2. **Web** (`dom`, `select`, `fill`) reads and writes the DOM of a page
    rendered in a browser tab, via injected JavaScript. This is what
    Accessibility can't see, a web page's own DOM is a separate tree from
-   the native UI tree.
+   the native UI tree. Needs a one-time `calibrate` per machine, see below.
 3. **Vision fallback** (`screenshot` + `click-xy`) is the safety net for
    anything the first two layers can't expose: canvas/custom-drawn UIs,
    games, images, non-accessible legacy apps, PDFs, video.
@@ -37,46 +99,27 @@ screenshot.
 Reach for layer 1 first, layer 2 for in-page web content, layer 3 only when
 the first two genuinely have nothing to offer.
 
-## Files
+## Calibration (web layer only)
 
-- `desktop`, the executable. `#!/usr/bin/env python3`, stdlib only, no pip
-  dependencies.
-- `_ax.js`, the Accessibility-tree engine, invoked via
-  `osascript -l JavaScript`. Not meant to be called directly.
-- `_key.js`, the key-combo dispatcher, same deal.
-- `.calibration.json.example`, a template for the per-display geometry
-  values the `dom`/`fill`/`select` web layer needs to translate a page's
-  own coordinates into absolute screen coordinates. Copy to
-  `.calibration.json` and run `calibrate` once per machine/display, see
-  below.
-
-## Dependencies
-
-- macOS. Uses the Accessibility API (System Events) and `osascript`.
-- **Python 3**, stdlib only. Use the system `/usr/bin/python3` rather than a
-  Homebrew Python if you hit `osascript`/AppleScript bridging issues; some
-  third-party Python builds don't wire up the ScriptingBridge the same way.
-- **Accessibility permission**: on first run, macOS will prompt to grant
-  your terminal app Accessibility access (System Settings > Privacy &
-  Security > Accessibility). Required for every native-layer command.
-- The web layer (`dom`, `select`, `fill`) currently targets a Chromium-based
-  browser reachable via `osascript`'s `execute javascript` (developed and
-  tested against Arc; should generalize to any Chromium browser with
-  "Allow JavaScript from Apple Events" enabled in its View menu).
-
-## Install
-
-No build step. Clone or copy the `desktop/` directory anywhere and run it
-directly:
+The `dom`/`fill`/`select` commands compute a web element's absolute screen
+position from its in-page coordinates plus the browser window's own chrome
+(toolbar height, sidebar width). That chrome varies by browser, zoom level,
+and display, so it's measured per machine, not shipped: `.calibration.json`
+is gitignored on purpose (copy `.calibration.json.example` to see its
+shape, but don't hand-edit it, `calibrate` writes it).
 
 ```bash
-cd desktop
-chmod +x desktop
-./desktop list-apps
+./desktop calibrate --app Arc
 ```
 
-The first native-layer command triggers the macOS Accessibility permission
-prompt. Approve it once for whichever terminal app you're running from.
+Run this once per machine/display combination, it makes a single
+corrective click to measure the offset and stores the result. Without it,
+the web layer falls back to a hardcoded default guess that's usually close
+but not exact, and every web-layer command now warns loudly on stderr when
+it's running on that uncalibrated guess (or on a stale one, e.g. after a
+sidebar toggle or a move to a different display), naming the exact
+`calibrate` command to fix it, so a bad click has an explanation instead of
+just being wrong.
 
 ## Usage
 
@@ -103,46 +146,40 @@ Run `desktop --help` (or `desktop <subcommand> --help`) for the full,
 current flag list, it's kept in sync with the code as the single source of
 truth.
 
-**Example, click a button by name:**
+## Dependencies
 
-```bash
-$ desktop find --role button --name "Sign in" --app Safari
-[{"role": "button", "name": "Sign in", "x": 812, "y": 140, "w": 90, "h": 32, "cx": 857, "cy": 156}]
-$ desktop click --role button --name "Sign in" --app Safari
-{"clicked": true, "role": "button", "name": "Sign in"}
-```
+- macOS. Uses the Accessibility API (System Events) and `osascript`.
+- **Python 3**, stdlib only. Use the system `/usr/bin/python3` rather than a
+  Homebrew Python if you hit `osascript`/AppleScript bridging issues; some
+  third-party Python builds don't wire up the ScriptingBridge the same way.
+- **cliclick**, the only input-injection primitive for a real OS click or
+  keystroke. `install.sh` installs it via Homebrew if missing.
+- **Accessibility permission** for your terminal app, see Install above.
+- The web layer (`dom`, `select`, `fill`) currently targets a Chromium-based
+  browser reachable via `osascript`'s `execute javascript` (developed and
+  tested against Arc; should generalize to any Chromium browser with
+  "Allow JavaScript from Apple Events" enabled in its View menu).
 
-## Calibration (web layer only)
+## Files
 
-The `dom`/`fill`/`select` commands compute a web element's absolute screen
-position from its in-page coordinates plus the browser window's own chrome
-(toolbar height, sidebar width). That chrome varies by browser, zoom level,
-and display. `calibrate` measures it once per machine/display combination
-with a single corrective click, and stores the result in
-`.calibration.json` (gitignored; copy `.calibration.json.example` to see
-the shape). Without a calibration file, the CLI falls back to a hardcoded
-default that's usually close but not exact, run `calibrate` for reliable
-clicks.
+- `desktop`, the executable. `#!/usr/bin/env python3`, stdlib only, no pip
+  dependencies.
+- `_ax.js`, the Accessibility-tree engine, invoked via
+  `osascript -l JavaScript`. Not meant to be called directly.
+- `_key.js`, the key-combo dispatcher, same deal.
+- `install.sh`, the install/verify script described above.
+- `.calibration.json.example`, a template for the per-display geometry
+  values the web layer needs. Copy to `.calibration.json` only if you want
+  to see the shape, `calibrate` writes the real file.
 
-## How to verify it works
+## Why no package.json
 
-```bash
-cd desktop
-./desktop list-apps
-```
-
-Success looks like a JSON array of your currently running GUI apps (name,
-bundle id, active flag, pid), and no Accessibility-permission error. If you
-get an empty array or a permission error, check System Settings > Privacy &
-Security > Accessibility for your terminal app.
-
-For the web layer, open any page in your Chromium-based browser and run:
-
-```bash
-./desktop dom --limit 5
-```
-
-Success looks like a JSON array of up to 5 elements from that page's DOM.
+`desktop`'s entry point is a Python script; `_ax.js`/`_key.js` run inside
+`osascript`'s own JavaScript engine, not under Node, and pull in no npm
+packages. There's nothing for `npm install` to resolve and no scripts a
+`package.json` would meaningfully wire up here, adding one would just be a
+file that does nothing. If that changes (a real Node dependency shows up),
+add one then.
 
 ## Known limits
 

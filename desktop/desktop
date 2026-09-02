@@ -101,6 +101,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -109,8 +110,56 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 AX_JS = os.path.join(HERE, "_ax.js")
 KEY_JS = os.path.join(HERE, "_key.js")
-CLICLICK = "/opt/homebrew/bin/cliclick"
+
+
+def _resolve_cliclick():
+    """PATH first (covers both Homebrew prefixes and anything else on
+    PATH), then the two well-known Homebrew install locations directly
+    (Apple Silicon /opt/homebrew, Intel /usr/local) in case cliclick was
+    installed but this shell's PATH doesn't include brew's bin dir yet.
+    Falls back to the Apple Silicon path so the resulting error message
+    ("cliclick not found at ...") still names a real, useful location.
+    """
+    found = shutil.which("cliclick")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/cliclick", "/usr/local/bin/cliclick"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return "/opt/homebrew/bin/cliclick"
+
+
+CLICLICK = _resolve_cliclick()
 CALIBRATION_FILE = os.path.join(HERE, ".calibration.json")
+
+# Substrings macOS's Accessibility-permission-denied errors are known to
+# contain, from `osascript`/System Events. Checked case-insensitively
+# against stderr so run_jxa_ax/run_jxa_key can tell "AX permission missing"
+# apart from any other osascript failure and say so in plain language
+# instead of surfacing a bare AppleEvent error number.
+_AX_DENIED_MARKERS = (
+    "not authorized to send apple events",
+    "not allowed assistive access",
+    "is not allowed to send keystrokes",
+    "-1743",
+    "(1002)",
+)
+
+AX_PERMISSION_HELP = (
+    "Accessibility permission is not granted to this terminal app. Every "
+    "native-layer command (windows/find/click/type/key/scroll/...) needs "
+    "it, and without it the AX tree reads empty and clicks silently do "
+    "nothing. Fix: System Settings > Privacy & Security > Accessibility, "
+    "enable the terminal app you're running this from (Terminal, iTerm2, "
+    "VS Code, etc.). If it's already listed and checked, remove it and "
+    "re-add it, macOS sometimes needs that after an app or OS update. "
+    "Then re-run this command."
+)
+
+
+def _is_ax_permission_denied(stderr_text):
+    lowered = (stderr_text or "").lower()
+    return any(marker in lowered for marker in _AX_DENIED_MARKERS)
 
 # Widened for Bug #5 (additive only -- every prior match is still matched):
 # platform cards / react-select options were absent from the default `dom`
@@ -153,17 +202,33 @@ def die(msg, code=1):
 
 
 def run_jxa_ax(command, args):
-    """Call _ax.js: -> parsed dict."""
+    """Call _ax.js: -> parsed dict.
+
+    AX-permission denial can surface two ways: osascript itself exits
+    non-zero (rare, top-level uncaught exception), or _ax.js's own
+    try/catch swallows it and returns a normal-looking {"error": "..."}
+    on stdout (the common case, since most _ax.js calls wrap the actual
+    AX access). Both are checked and rewritten to AX_PERMISSION_HELP so
+    the caller gets an actionable fix instead of a bare AppleEvent error
+    number (the whole point of this check, an empty AX tree with no
+    explanation is the worst first-run experience there is).
+    """
     proc = subprocess.run(
         ["osascript", "-l", "JavaScript", AX_JS, command, json.dumps(args)],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        return {"error": "osascript failed: " + (proc.stderr or "").strip()}
+        stderr = (proc.stderr or "").strip()
+        if _is_ax_permission_denied(stderr):
+            return {"error": AX_PERMISSION_HELP, "detail": stderr}
+        return {"error": "osascript failed: " + stderr}
     try:
-        return json.loads(proc.stdout.strip())
+        out = json.loads(proc.stdout.strip())
     except ValueError:
         return {"error": "could not parse AX output: " + proc.stdout[:300]}
+    if isinstance(out, dict) and _is_ax_permission_denied(out.get("error", "")):
+        return {"error": AX_PERMISSION_HELP, "detail": out.get("error")}
+    return out
 
 
 def run_jxa_key(key, mods):
@@ -174,11 +239,17 @@ def run_jxa_key(key, mods):
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        return {"error": "osascript failed: " + (proc.stderr or "").strip()}
+        stderr = (proc.stderr or "").strip()
+        if _is_ax_permission_denied(stderr):
+            return {"error": AX_PERMISSION_HELP, "detail": stderr}
+        return {"error": "osascript failed: " + stderr}
     try:
-        return json.loads(proc.stdout.strip())
+        out = json.loads(proc.stdout.strip())
     except ValueError:
         return {"error": "could not parse key output: " + proc.stdout[:300]}
+    if isinstance(out, dict) and _is_ax_permission_denied(out.get("error", "")):
+        return {"error": AX_PERMISSION_HELP, "detail": out.get("error")}
+    return out
 
 
 def cliclick(*cmds):
@@ -1014,23 +1085,55 @@ def dom_query(browser, selector, limit, top_chrome_override=None, left_chrome_ov
     }
 
 
+def warn_if_uncalibrated(app, top_calibrated, top_source, top_stale,
+                          left_calibrated, left_source, left_stale):
+    """Shared stderr guard for every web-layer command that computes a
+    screen point from chrome-offset math (dom, and every real click that
+    goes through real_click_verified: select's combobox commit, fill's
+    real-key path, click's web fallback).
+
+    Two distinct cases, both worth a loud warning, previously only one was
+    caught (2026-09-01 incident: both real bugs happened with the *Stale
+    booleans sitting True in the JSON and nobody looked, so the original
+    guard only fired on "stale" -- a PREVIOUSLY-calibrated machine whose
+    calibration no longer matches). That guard silently said nothing on a
+    FRESH install with no .calibration.json at all (source=="default-guess",
+    calibrated=False, stale=False, since "stale" means "was valid, now
+    isn't" and a install that was never calibrated was never valid to begin
+    with). That's exactly the worst first-run case: no calibration file
+    (deliberately not shipped, machine-specific) plus a click that silently
+    lands on the wrong element with no explanation. Fires on either case,
+    never touches stdout/exit code so it can't break a caller parsing JSON.
+    """
+    stale = bool(top_stale or left_stale)
+    never_calibrated = not (top_calibrated or left_calibrated)
+    if not (stale or never_calibrated):
+        return
+    if never_calibrated:
+        sys.stderr.write(
+            "WARNING: no calibration found for this machine (.calibration.json is "
+            "deliberately not shipped, it's machine/display specific). Coordinates "
+            "in this output are an UNCALIBRATED default guess and clicks derived "
+            "from them may land on the wrong element. Run `desktop calibrate --app "
+            "%s` once, then re-run this command.\n" % app
+        )
+    else:
+        sys.stderr.write(
+            "WARNING: coordinates in this output are UNCALIBRATED for the current window "
+            "state (topChromeStale=%s source=%s, leftChromeStale=%s source=%s) -- run "
+            "`desktop calibrate --app %s` before trusting clicks derived from it\n"
+            % (top_stale, top_source, left_stale, left_source, app)
+        )
+
+
 def cmd_dom(args):
     out = dom_query(args.app, args.selector, args.limit, args.top_chrome, args.left_chrome)
     print(json.dumps(out))
-    # Loud guard (2026-09-01): both real incidents happened with these two
-    # booleans sitting in the JSON, correctly False->stale, and nobody
-    # looked. Nothing about a caller reading `dom`'s JSON forces them to
-    # check topChromeStale/leftChromeStale, so print a stderr warning any
-    # time either is true -- cheap, and it doesn't touch stdout/exit code
-    # so it can't break a caller parsing the JSON.
-    if out.get("topChromeStale") or out.get("leftChromeStale"):
-        sys.stderr.write(
-            "WARNING: coordinates in this dom output are UNCALIBRATED for the current window "
-            "state (topChromeStale=%s source=%s, leftChromeStale=%s source=%s) -- run "
-            "`desktop calibrate --app %s` before trusting clicks derived from it\n"
-            % (out.get("topChromeStale"), out.get("topChromeSource"),
-               out.get("leftChromeStale"), out.get("leftChromeSource"), args.app)
-        )
+    warn_if_uncalibrated(
+        args.app,
+        out.get("topChromeCalibrated"), out.get("topChromeSource"), out.get("topChromeStale"),
+        out.get("leftChromeCalibrated"), out.get("leftChromeSource"), out.get("leftChromeStale"),
+    )
     if "error" in out:
         sys.exit(1)
 
@@ -1097,8 +1200,15 @@ def real_click_verified(browser, rect, verify_fn):
                                     "REJECTED, using AX frame as ground truth (Fix #1)")
 
     display = resolve_window_display(browser)
-    top_chrome, _tcal, _tsrc, _tstale = get_top_chrome(browser, ax_frame, win_metrics, None)
-    left_chrome, _lcal, _lsrc, _lstale = get_left_chrome(browser, ax_frame, win_metrics, None)
+    top_chrome, tcal, tsrc, tstale = get_top_chrome(browser, ax_frame, win_metrics, None)
+    left_chrome, lcal, lsrc, lstale = get_left_chrome(browser, ax_frame, win_metrics, None)
+    # This is the ONE real-mouse escalation primitive (select's combobox
+    # commit, fill's real-key path, click's web fallback all route through
+    # here), so this is where an uncalibrated machine's FIRST real click
+    # happens -- warn here, not just in `dom`, or a caller who never runs
+    # `dom` first never sees the warning at all before something silently
+    # clicks the wrong spot.
+    warn_if_uncalibrated(browser, tcal, tsrc, tstale, lcal, lsrc, lstale)
     backing_scale, zoom_trustworthy, _idx = _screen_backing_scale_factor(ax_frame)
     browser_dpr = win_metrics.get("dpr") if win_metrics else None
     zoom_factor = 1.0
