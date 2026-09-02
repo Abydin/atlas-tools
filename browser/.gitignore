@@ -16,7 +16,7 @@ state/uploads/
 
 # Per-run audit trail (transcripts + screenshots). Durable but not source,
 # lives on disk under this dir; not meant to bloat the repo.
-artifacts/*/
+artifacts/
 
 logs/
 
