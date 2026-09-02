@@ -29,7 +29,16 @@ const { URL } = require('url');
 //   javascript:      would execute in the frame if ever navigated to
 //   about: (non-blank) internal browser pages
 //   chrome:, chrome-extension:, view-source:  browser-internal surfaces
-const ALLOWED_PROTOCOLS = new Set(['http:', 'https:']);
+//
+// ws:/wss: are included for a different call site than the others: a page
+// never NAVIGATES to a ws(s): URL (page.goto() has no meaning for that
+// scheme, so open()'s assertSafeUrl() call never sees one in practice).
+// They are allowed here so the same function can validate the scheme of a
+// WebSocket a page opens, checked from context.routeWebSocket() in
+// atlas-browser.js alongside assertSafeDestination() on the same URL -
+// see HOLE 6 there for why a WebSocket needs its own guard at all
+// (context.route() does not intercept it).
+const ALLOWED_PROTOCOLS = new Set(['http:', 'https:', 'ws:', 'wss:']);
 
 function assertSafeUrl(input) {
   let parsed;

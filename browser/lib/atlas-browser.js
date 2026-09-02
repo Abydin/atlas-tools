@@ -223,6 +223,32 @@ class AtlasBrowser {
       }
     });
 
+    // HOLE 6: context.route() above only intercepts fetch/XHR/navigation-
+    // style requests - it does NOT see WebSocket connections. Verified
+    // directly: a page opening `new WebSocket('ws://127.0.0.1:<port>/')`
+    // reached a real loopback listener with the route guard above fully
+    // installed and the URL never appeared in the route handler's request
+    // list at all. That is the same SSRF class HOLE 5 closed for HTTP,
+    // still open over ws:/wss:, so it gets its own guard rather than
+    // being folded into the HTTP route above. Same two checks as every
+    // other guarded call site: scheme (assertSafeUrl - ws:/wss: are the
+    // only schemes a WebSocket constructor accepts, so this mostly rejects
+    // a malformed URL) and resolved destination (assertSafeDestination -
+    // the actual SSRF boundary). A blocked socket is closed with 1008
+    // (policy violation) rather than left to mock/hang, so the page's own
+    // onerror/onclose fires promptly instead of looking like a stall.
+    await this.context.routeWebSocket('**/*', async (ws) => {
+      const wsUrl = ws.url();
+      try {
+        assertSafeUrl(wsUrl);
+        await assertSafeDestination(wsUrl);
+        ws.connectToServer();
+      } catch (err) {
+        console.error(`[atlas-browser] SECURITY: blocked WebSocket to "${wsUrl}": ${err.message}`);
+        await ws.close({ code: 1008, reason: 'blocked by atlas-browser SSRF guard' }).catch(() => {});
+      }
+    });
+
     // Apply the JS/DOM-level fingerprint normalization (lib/fingerprint-normalize.js) to every
     // page in this context from here on - addInitScript() runs before any
     // page script on every new document, including iframes, in every tab
