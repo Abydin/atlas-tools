@@ -1,0 +1,3394 @@
+#!/usr/bin/python3
+"""
+desktop -- universal macOS desktop-control CLI for Atlas.
+
+Drives ANY app (Finder, System Settings, VS Code, Notes, native dialogs, Arc's
+own chrome) by element NAME via the Accessibility (AX) tree, plus reads INSIDE
+a web page's DOM in Arc via `execute javascript`. Native-first, vision-fallback:
+`find`/`dom` give exact coordinates from the app/page itself, so `screenshot`
++ eyeballing pixels is the LAST resort, not the default.
+
+Deliberately uses the system python3 (/usr/bin/python3, shebang above), NOT
+homebrew python -- avoids the launchd/homebrew python-path and missing-module
+class of bugs this team has been bitten by before. Stdlib only, no pip deps.
+
+SUBCOMMANDS
+  list-apps                                    running GUI apps
+  focus       --app NAME                       bring app to foreground
+  windows     [--app NAME]                     windows of app (default: frontmost)
+  find        --role R [--name N] [--limit L] [--app A] [--window-index I]
+                                                query the AX tree: name, value, x/y, w/h, center
+  dom         [--app Arc] [--selector CSS] [--limit L]
+                                                query the ACTIVE TAB's web page DOM (Arc only);
+                                                absolute coords are browser-zoom-normalized;
+                                                default selector now also catches cards/options
+  fill        SELECTOR VALUE [--name N] [--index K] [--enter] [--app Arc]
+              [--await-human S] [--no-verify]  set a web input/textarea's value via the
+                                                React-safe native setter (JS-bridge-first,
+                                                replaces `type` for web content). Verifies by
+                                                reading back; a value the form store accepted
+                                                but a validator still rejects surfaces as a
+                                                hand-to-human escalation, never a false ok
+  select      --value V [--name N] [--selector CSS] [--index K] [--app A]
+              [--retries N]                    set a native <select> via JS (.value + change,
+                                                no click at all), OR a custom ARIA/react-select
+                                                combobox via JS open+poll THEN a REAL cliclick
+                                                commit at the option's own rect (dispatched
+                                                clicks are ignored by these widgets)
+  set-select  ...                              DEPRECATED alias for `select`, one release only
+  click       --role R --name N [--index K] [--app A] [--double] [--right]
+              | --selector CSS [--name N] [--index K] [--app Arc]
+                                                native AX mode: find then AXPress that element.
+                                                web mode (--selector): dispatched JS click first,
+                                                escalates to a REAL click if state didn't change
+  click-xy    X Y [--double] [--right] [--from-view VIEWWIDTH]
+                                                click raw screen coords
+  type        --text "..." [--enter]           type text at current focus. NATIVE APPS ONLY,
+                                                does NOT reach browser web inputs, use `fill`
+  key         --key K [--cmd] [--shift] [--option] [--control]
+                                                press a key combo
+  scroll      --direction up|down [--amount N] approximate scroll (arrow-key presses)
+  wait        --role R --name N [--timeout S] [--click] [--app A]
+                                                poll locally until element appears
+  macro       '<json array of actions>'        run a stop-on-failure action sequence
+  screenshot  [outpath] [--display auto|N] [--app A]
+                                                FALLBACK: full-screen capture, downsampled;
+                                                --display auto resolves --app's actual display;
+                                                cursor compositing is always on (screencapture's
+                                                -C flag, hardcoded, not a CLI flag of this tool),
+                                                always reports its live point numerically too
+
+Every subcommand prints JSON to stdout and exits non-zero with a clear
+"error" field on failure (also on stdout, so `python3 -c` one-liners and
+shell `| python3 -m json.tool` both work without redirect gymnastics).
+
+HONEST LIMITATIONS
+  - `find` walks the Accessibility tree via System Events. It is reliable for
+    NATIVE UI: Finder, System Settings, VS Code chrome, Notes, native dialogs,
+    and a browser's OWN chrome (Arc's tab bar, sidebar, URL bar). It is NOT
+    reliable for the content INSIDE a web page rendered by a browser -- that's
+    what `dom` is for (Arc only, via `execute javascript` on the active tab).
+  - `dom`'s absolute screen coordinates are DERIVED, not independently
+    verified by an actual click (see compute_dom_absolute() below for the
+    exact formula and its assumption). Cross-check with `find`/`windows`
+    output if a click lands wrong.
+  - `dom`'s coordinates are normalized against the page's current browser
+    zoom (via window.devicePixelRatio vs NSScreen.backingScaleFactor, see
+    dom_query()'s docstring), so a click stays accurate at any zoom level,
+    100% or otherwise. Chrome offsets (top/left) are NOT zoom-scaled --
+    they're OS-level window chrome, unaffected by page zoom.
+  - Native HTML <select>/<option> popups do not accept synthetic clicks or
+    keystrokes (the macOS native popup menu ignores injected CGEvents), and
+    an OPEN native popup jams the page's JS thread, blocking `dom` entirely
+    until dismissed. Use `select` instead, it sets the value via JS and
+    never opens the native popup. If a popup does get stuck open (e.g. a
+    prior manual click), `execute javascript` calls auto-retry once after
+    sending Escape (see JS_EXEC_TIMEOUT_SECONDS / _arc_execute_js()).
+  - `scroll` has no real scroll-wheel event available from cliclick 5.1 (it
+    was checked: no such command exists). It approximates by sending repeated
+    arrow-key presses via System Events, which scrolls most content but is
+    not a true wheel-delta event -- some web widgets that specifically listen
+    for wheel events may not respond.
+
+COORDINATION -- read before running anything that moves the mouse or sends
+keystrokes. See README.md in this directory for the full rule; short version:
+if something else is actively driving the desktop, only list-apps / windows /
+find / dom (read-only) are safe to run concurrently. focus / click / click-xy
+/ type / key / scroll / wait --click / macro all steal focus or inject input.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+AX_JS = os.path.join(HERE, "_ax.js")
+KEY_JS = os.path.join(HERE, "_key.js")
+CLICLICK = "/opt/homebrew/bin/cliclick"
+CALIBRATION_FILE = os.path.join(HERE, ".calibration.json")
+
+# Widened for Bug #5 (additive only -- every prior match is still matched):
+# platform cards / react-select options were absent from the default `dom`
+# output on the live UXCam session, only showing up with an explicit
+# --selector, which made targeting them harder than it needed to be.
+DEFAULT_DOM_SELECTOR = ("a,button,input,textarea,select,[role=button],[onclick],"
+                         "[role=option],[class*=card],[class*=option],li[role]")
+
+# Ceiling for a single `execute javascript` call. Normal calls return in well
+# under a second; this only matters when something is genuinely stuck, most
+# commonly a native <select>/<option> popup left open (macOS's native popup
+# menu runs outside the page's JS event loop and blocks it until dismissed).
+# See _arc_execute_js()'s auto-Escape-and-retry-once behavior below.
+JS_EXEC_TIMEOUT_SECONDS = 8
+
+# Best-effort guess for Arc's top-chrome height in points, used only until a
+# real `calibrate` run has measured it for real. This number came from ONE
+# live measurement of (outerHeight - innerHeight) = 52, assumed (not proven)
+# to be entirely top chrome. Never trust it for a real click without checking
+# `topChromeCalibrated` in `dom`'s output first.
+DEFAULT_TOP_CHROME_GUESS = 52
+
+# There is no fixed default-guess constant for left_chrome the way there is
+# for top_chrome: the natural pre-calibration guess is whatever
+# (outerW - innerW) reports for the CURRENT window (that was this toolkit's
+# original, since-proven-wrong assumption for the X axis, kept only as the
+# uncalibrated fallback, not trusted). A live `calibrate` run found Arc's
+# real left chrome was ~90pt wider than that delta reports (327 modeled vs
+# 417 actual), never trust it for a real click without checking
+# `leftChromeCalibrated` in `dom`'s output first.
+
+
+# ---------------------------------------------------------------------------
+# low-level helpers
+# ---------------------------------------------------------------------------
+
+def die(msg, code=1):
+    print(json.dumps({"error": msg}))
+    sys.exit(code)
+
+
+def run_jxa_ax(command, args):
+    """Call _ax.js: -> parsed dict."""
+    proc = subprocess.run(
+        ["osascript", "-l", "JavaScript", AX_JS, command, json.dumps(args)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return {"error": "osascript failed: " + (proc.stderr or "").strip()}
+    try:
+        return json.loads(proc.stdout.strip())
+    except ValueError:
+        return {"error": "could not parse AX output: " + proc.stdout[:300]}
+
+
+def run_jxa_key(key, mods):
+    args = {"key": key}
+    args.update(mods)
+    proc = subprocess.run(
+        ["osascript", "-l", "JavaScript", KEY_JS, json.dumps(args)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return {"error": "osascript failed: " + (proc.stderr or "").strip()}
+    try:
+        return json.loads(proc.stdout.strip())
+    except ValueError:
+        return {"error": "could not parse key output: " + proc.stdout[:300]}
+
+
+def cliclick(*cmds):
+    if not os.access(CLICLICK, os.X_OK):
+        return {"error": "cliclick not found at " + CLICLICK + " (brew install cliclick)"}
+    proc = subprocess.run([CLICLICK] + list(cmds), capture_output=True, text=True)
+    if proc.returncode != 0:
+        return {"error": "cliclick failed: " + (proc.stderr or "").strip()}
+    return {"ok": True}
+
+
+def _cliclick_cursor_position():
+    """Live cursor point (screen points, quartz/AX space), via cliclick's
+    own `p:.` (print-position, no move). None on any failure -- never guess
+    a stale/zero point."""
+    if not os.access(CLICLICK, os.X_OK):
+        return None
+    proc = subprocess.run([CLICLICK, "p:."], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    parts = proc.stdout.strip().split(",")
+    if len(parts) != 2:
+        return None
+    try:
+        return {"x": int(parts[0]), "y": int(parts[1])}
+    except ValueError:
+        return None
+
+
+def screen_width_points(display_index=None):
+    """
+    Live-query the width (in points) of a display. NEVER guess a fallback
+    number here, a wrong guess silently mis-scales every --from-view click.
+    On any query failure this hard-fails the whole command instead.
+
+    display_index: None or 0 means the main display (NSScreen.mainScreen,
+    always correct). A positive index (1-based, matching screencapture's -D
+    numbering) is a best-effort lookup into NSScreen.screens, see the
+    caveat on that ordering in cmd_screenshot / README.
+    """
+    ax_args = {}
+    if display_index:
+        ax_args["index"] = display_index - 1  # screencapture -D is 1-based
+    info = run_jxa_ax("screen", ax_args)
+    if "error" in info or "widthPoints" not in info:
+        die("could not query screen width for --from-view scaling: " + str(info.get("error", info)))
+    return info["widthPoints"]
+
+
+def _viewport_to_screen(ax_frame, top_chrome, left_chrome, zoom_factor, vx, vy):
+    """
+    The one formula every absolute-coordinate consumer (dom reads AND the
+    real-click escalation primitive) must share, so a reader and a clicker
+    can never drift apart:
+      absX = axWindowX + left_chrome + round(vx * zoom_factor)
+      absY = axWindowY + top_chrome  + round(vy * zoom_factor)
+
+    ax_frame is the AX-reported window frame (x/y from `windows --app
+    <browser>`, i.e. System Events' own position() for the real window) --
+    the SINGLE ground truth for window origin (Fix #1, Asclepius QA finding).
+    window.screenX/window.screenY (the JS self-report) must NEVER be used
+    here: under a hardware-mirrored display configuration (built-in panel
+    mirroring an external ultrawide), Chromium reports screenX/screenY as
+    (0,0) and outerWidth/outerHeight as the full MIRRORED DISPLAY size
+    (e.g. 3440x1440) instead of the real window frame (e.g. 20,20,1519x1063
+    per AX) -- every absolute point computed off the JS numbers misses the
+    visible window entirely. AX's position()/size() are unaffected by
+    mirroring since they come from the window server, not the page's view
+    of its own screen. Returns (abs_x, abs_y) as ints.
+    """
+    abs_x = ax_frame["x"] + left_chrome + round(vx * zoom_factor)
+    abs_y = ax_frame["y"] + top_chrome + round(vy * zoom_factor)
+    return int(abs_x), int(abs_y)
+
+
+def _is_app_running(app_name):
+    apps = run_jxa_ax("list-apps", {})
+    if not isinstance(apps, list):
+        return False
+    return any(a.get("name") == app_name for a in apps)
+
+
+# Belt-and-suspenders guard for Fix #1: this NEVER changes which numbers get
+# used for positioning (ax_frame always wins, see _viewport_to_screen), it
+# only cross-checks the JS self-report against AX so a caller/log can see
+# the corrupted-JS-geometry case explicitly instead of silently trusting
+# numbers that happen to be wrong. Generous tolerance -- window-manager
+# rounding/inset differences of a few px are normal and not the failure
+# mode this guards against (a whole-display-sized mismatch is).
+GEOMETRY_AGREEMENT_TOLERANCE_PX = 15
+
+
+def _check_js_geometry_against_ax(win_metrics, ax_frame):
+    """
+    Compares window.screenX/screenY/outerWidth/outerHeight (JS self-report)
+    against the AX-reported window frame (System Events position/size, the
+    single ground truth -- see _viewport_to_screen). Returns
+    (agrees: bool|None, detail: dict). agrees is None only when either side
+    couldn't be read at all (nothing to compare); detail always carries both
+    raw readings when available for logging/debugging.
+    """
+    if not win_metrics or not ax_frame:
+        return None, {"reason": "missing-metrics", "haveWinMetrics": bool(win_metrics),
+                       "haveAxFrame": bool(ax_frame)}
+    js_x, js_y = win_metrics.get("screenX"), win_metrics.get("screenY")
+    js_w, js_h = win_metrics.get("outerW"), win_metrics.get("outerH")
+    ax_x, ax_y, ax_w, ax_h = ax_frame.get("x"), ax_frame.get("y"), ax_frame.get("w"), ax_frame.get("h")
+    if None in (js_x, js_y, js_w, js_h, ax_x, ax_y, ax_w, ax_h):
+        return None, {"reason": "incomplete-metrics"}
+    agrees = (abs(js_x - ax_x) <= GEOMETRY_AGREEMENT_TOLERANCE_PX
+              and abs(js_y - ax_y) <= GEOMETRY_AGREEMENT_TOLERANCE_PX
+              and abs(js_w - ax_w) <= GEOMETRY_AGREEMENT_TOLERANCE_PX
+              and abs(js_h - ax_h) <= GEOMETRY_AGREEMENT_TOLERANCE_PX)
+    return agrees, {
+        "js": {"x": js_x, "y": js_y, "w": js_w, "h": js_h},
+        "ax": {"x": ax_x, "y": ax_y, "w": ax_w, "h": ax_h},
+    }
+
+
+# ---------------------------------------------------------------------------
+# top/left-chrome calibration store (.calibration.json (next to this script))
+#
+# `dom`'s absolute-coordinate formula needs to know how tall/wide Arc's
+# chrome is, in points, above/beside the page viewport, on BOTH axes:
+#   absScreenY = windowY + top_chrome  + viewportY
+#   absScreenX = windowX + left_chrome + viewportX
+# Neither number can be safely derived from window.outerWidth/outerHeight -
+# window.innerWidth/innerHeight alone: a live `calibrate` run proved BOTH of
+# this toolkit's original assumptions wrong.
+#   - outerH - innerH is TOP chrome + BOTTOM chrome combined (assuming it's
+#     all top chrome put a click a bar-height too low, fixed in an earlier
+#     revision with top_chrome).
+#   - outerW - innerW is NOT Arc's real left-sidebar width either: a live
+#     run found the model value (327) undershot the real left chrome (417)
+#     by ~90pt, Arc's actual chrome is wider than the outer/inner window
+#     delta reports (there is presumably some non-viewport, non-chrome
+#     padding/inset the delta doesn't account for).
+# So both top_chrome and left_chrome are resolved the same way: an explicit
+# --top-chrome/--left-chrome override, a previously `calibrate`-measured
+# value (this file), or a clearly-marked UNCALIBRATED default guess. Never
+# silently trust a stored value if the window's chrome delta on that AXIS
+# has changed since it was measured (resize, fullscreen toggle, sidebar
+# collapse can all change chrome height and/or width independently) -- see
+# get_top_chrome() / get_left_chrome().
+#
+# BUG (found 2026-09-01, cost two multi-hour incidents): the chrome-delta
+# signature above is (ax_frame h/w) minus (JS innerH/innerW). That delta is
+# the height/width of Arc's FIXED chrome elements (toolbar, tab strip,
+# sidebar) -- it does NOT scale with the window's own size or move with the
+# window's origin, so resizing, moving, or fullscreening the window all
+# leave it completely unchanged UNLESS the chrome itself restructures (a
+# sidebar collapse does restructure it, and IS caught -- confirmed live: it
+# moved the width delta from 327 to 20). Measured live across windowed,
+# moved, and fullscreen geometries on 2026-09-01: the delta stayed exactly
+# 52/327 in all three, so "config-stale" never fired in any of them, exactly
+# matching the reported symptom (topChromeStale/leftChromeStale both False
+# in fullscreen). A live `calibrate` run in each of those three geometries
+# also came back with deltaX/deltaY of 0 every time here -- meaning on this
+# Arc build, fullscreen did NOT actually move the true offset, so the two
+# real incidents were not reproduced by "fullscreen changes the chrome
+# math" as such. But AXFullScreen is a real, directly-readable, high-
+# consequence state change the resolver had ZERO visibility into -- it was
+# only ever inferred through the delta proxy, which can't see it by
+# construction. Both real incidents happened with a calibration recorded
+# windowed and read back in fullscreen, so this file and the resolvers now
+# also record/compare AXFullScreen directly (fullScreenAtCalibration below),
+# independent of the delta check, biased toward firing stale on any
+# mismatch -- see the "config-stale-fullscreen" source in get_top_chrome()/
+# get_left_chrome().
+# ---------------------------------------------------------------------------
+
+def load_calibration():
+    if not os.path.exists(CALIBRATION_FILE):
+        return {}
+    try:
+        with open(CALIBRATION_FILE) as f:
+            return json.load(f)
+    except (ValueError, OSError):
+        return {}
+
+
+def save_calibration(browser, top_chrome, left_chrome, ax_frame, win_metrics,
+                      display_index=None, backing_scale=None):
+    """
+    ax_frame is the AX-reported window frame (Fix #1 ground truth, see
+    _viewport_to_screen); win_metrics is the JS self-report, used here only
+    for innerW/innerH (viewport size, unaffected by the mirrored-display
+    corruption) and dpr. The staleness signatures below are the AX frame's
+    w/h minus the JS viewport's innerW/innerH -- NOT window.outerWidth/
+    outerHeight, which misreport the full mirrored display's size under
+    a hardware-mirrored multi-display setup and would make every staleness check
+    meaningless (outerW/outerH don't change when the real window resizes).
+    """
+    data = load_calibration()
+    data[browser.lower()] = {
+        "topChrome": top_chrome,
+        "leftChrome": left_chrome,
+        "calibratedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        # staleness signatures, per axis: if EITHER delta differs at read
+        # time, that axis's calibration no longer applies and must be redone
+        # (the two can go stale independently, e.g. a sidebar collapse
+        # changes width but not height).
+        "chromeHeightDeltaAtCalibration": ax_frame["h"] - win_metrics["innerH"],
+        "chromeWidthDeltaAtCalibration": ax_frame["w"] - win_metrics["innerW"],
+        "outerHAtCalibration": ax_frame["h"],
+        "innerHAtCalibration": win_metrics["innerH"],
+        "outerWAtCalibration": ax_frame["w"],
+        "innerWAtCalibration": win_metrics["innerW"],
+        # display-aware staleness (Bug #3): a calibration measured on one
+        # display is meaningless on another, and can't be caught by the
+        # chrome-delta signature alone (a window dragged between two
+        # displays of the SAME chrome height/width would pass that check
+        # and still be wrong, e.g. different backing scale).
+        "displayIndexAtCalibration": display_index,
+        "backingScaleAtCalibration": backing_scale,
+        # AXFullScreen at calibration time (None if it couldn't be read),
+        # compared live in get_top_chrome/get_left_chrome -- the chrome-
+        # delta signature above cannot see a fullscreen toggle by
+        # construction (see the BUG note above this function), so this is
+        # an independent, directly-observed signal for the exact state
+        # both real 2026-09-01 incidents happened in.
+        "fullScreenAtCalibration": ax_frame.get("fullScreen"),
+    }
+    with open(CALIBRATION_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def get_top_chrome(browser, ax_frame, win_metrics, cli_override, display_index=None, backing_scale=None):
+    """
+    Returns (value, calibrated: bool, source: str, stale: bool).
+
+    Precedence: explicit --top-chrome flag > a still-valid stored
+    calibration > an UNCALIBRATED default guess. A stored calibration is
+    considered valid only if (a) the window's current vertical chrome delta
+    (ax_frame's h - JS innerH) matches the delta recorded at calibration
+    time, AND (b) the window is still on the same display with the same
+    backing scale it was calibrated on -- Arc's chrome can happen to measure
+    the same delta on two different displays and still be wrong (source is
+    then "config-stale-display", not the generic "config-stale", so a caller
+    can tell "chrome changed" apart from "you moved screens" if it matters).
+    display_index/backing_scale are best-effort (from resolve_window_display
+    or _screen_backing_scale_factor); when unavailable this check is skipped
+    and only the chrome-delta signature applies, same as before this fix.
+
+    ax_frame (the AX window frame, Fix #1 ground truth) supplies h;
+    window.outerHeight is NEVER used for this delta -- under a hardware-
+    mirrored display it reports the full mirrored display's height, not the
+    real window's, which would make the staleness signature meaningless.
+    """
+    if cli_override is not None:
+        return cli_override, True, "cli-flag", False
+
+    data = load_calibration()
+    entry = data.get(browser.lower())
+    if entry and ax_frame and win_metrics and "topChrome" in entry:
+        stored_display = entry.get("displayIndexAtCalibration")
+        stored_scale = entry.get("backingScaleAtCalibration")
+        display_moved = (display_index is not None and stored_display is not None
+                          and display_index != stored_display)
+        scale_changed = (backing_scale is not None and stored_scale is not None
+                          and backing_scale != stored_scale)
+        if display_moved or scale_changed:
+            return DEFAULT_TOP_CHROME_GUESS, False, "config-stale-display", True
+        # AXFullScreen mismatch, independent of the delta check below (see
+        # the BUG note above save_calibration -- the delta is provably
+        # blind to a fullscreen toggle by construction, confirmed live on
+        # 2026-09-01, so this is checked directly rather than inferred).
+        # Both sides None (older calibration file, or AX read failed) skips
+        # this check rather than guessing, same convention as display/scale.
+        stored_fullscreen = entry.get("fullScreenAtCalibration")
+        current_fullscreen = ax_frame.get("fullScreen")
+        if stored_fullscreen is not None and current_fullscreen is not None \
+                and stored_fullscreen != current_fullscreen:
+            return DEFAULT_TOP_CHROME_GUESS, False, "config-stale-fullscreen", True
+        current_delta = ax_frame["h"] - win_metrics["innerH"]
+        stored_delta = entry.get("chromeHeightDeltaAtCalibration")
+        if stored_delta == current_delta:
+            return entry["topChrome"], True, "config", False
+        return DEFAULT_TOP_CHROME_GUESS, False, "config-stale", True
+
+    return DEFAULT_TOP_CHROME_GUESS, False, "default-guess", False
+
+
+def get_left_chrome(browser, ax_frame, win_metrics, cli_override, display_index=None, backing_scale=None):
+    """
+    Returns (value, calibrated: bool, source: str, stale: bool). Mirrors
+    get_top_chrome() exactly, on the X axis (including the display/backing-
+    scale staleness check, "config-stale-display"). There is no fixed
+    default-guess constant here (unlike DEFAULT_TOP_CHROME_GUESS): the
+    uncalibrated fallback is (ax_frame's w - JS innerW) for the CURRENT
+    window -- ax_frame (Fix #1 ground truth) supplies w; window.outerWidth
+    is NEVER used here, same reasoning as get_top_chrome (mirrored-display
+    corruption makes it report the full mirrored display's width).
+    """
+    default_guess = (ax_frame["w"] - win_metrics["innerW"]) if (ax_frame and win_metrics) else 0
+
+    if cli_override is not None:
+        return cli_override, True, "cli-flag", False
+
+    data = load_calibration()
+    entry = data.get(browser.lower())
+    if entry and ax_frame and win_metrics and "leftChrome" in entry:
+        stored_display = entry.get("displayIndexAtCalibration")
+        stored_scale = entry.get("backingScaleAtCalibration")
+        display_moved = (display_index is not None and stored_display is not None
+                          and display_index != stored_display)
+        scale_changed = (backing_scale is not None and stored_scale is not None
+                          and backing_scale != stored_scale)
+        if display_moved or scale_changed:
+            return default_guess, False, "config-stale-display", True
+        # See get_top_chrome()'s matching check -- same reasoning, mirrored.
+        stored_fullscreen = entry.get("fullScreenAtCalibration")
+        current_fullscreen = ax_frame.get("fullScreen")
+        if stored_fullscreen is not None and current_fullscreen is not None \
+                and stored_fullscreen != current_fullscreen:
+            return default_guess, False, "config-stale-fullscreen", True
+        current_delta = ax_frame["w"] - win_metrics["innerW"]
+        stored_delta = entry.get("chromeWidthDeltaAtCalibration")
+        if stored_delta == current_delta:
+            return entry["leftChrome"], True, "config", False
+        return default_guess, False, "config-stale", True
+
+    return default_guess, False, "default-guess", False
+
+
+# ---------------------------------------------------------------------------
+# subcommand implementations
+# ---------------------------------------------------------------------------
+
+def cmd_list_apps(args):
+    out = run_jxa_ax("list-apps", {})
+    print(json.dumps(out))
+    if isinstance(out, dict) and "error" in out:
+        sys.exit(1)
+
+
+def cmd_focus(args):
+    out = run_jxa_ax("activate", {"app": args.app})
+    print(json.dumps(out))
+    if "error" in out:
+        sys.exit(1)
+
+
+def cmd_windows(args):
+    out = run_jxa_ax("windows", {"app": args.app})
+    print(json.dumps(out))
+    if "error" in out:
+        sys.exit(1)
+
+
+def cmd_find(args):
+    out = run_jxa_ax("find", {
+        "app": args.app, "role": args.role, "name": args.name,
+        "limit": args.limit, "windowIndex": args.window_index,
+    })
+    print(json.dumps(out))
+    if "error" in out:
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# dom: query the active tab's web page in Arc via `execute javascript`
+# ---------------------------------------------------------------------------
+
+def _osascript_string_literal(js):
+    """Escape a JS payload for embedding inside an AppleScript double-quoted string."""
+    return js.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _arc_execute_js(js, browser="Arc", _allow_retry=True):
+    """
+    Run `js` in the active tab's page context, return (ok, raw_stdout, stderr).
+
+    Bounded by JS_EXEC_TIMEOUT_SECONDS. A native macOS popup menu (most
+    commonly an open <select>/<option> dropdown, but also e.g. a native
+    autofill suggestion list) runs OUTSIDE the page's JS event loop and
+    BLOCKS it entirely while open -- `execute javascript` hangs until the
+    popup is dismissed. System Events keystrokes, unlike page JS, are
+    OS-level and still get delivered while the page is jammed, so on a
+    timeout this sends Escape (dismisses any open native popup/menu without
+    touching the mouse) and retries ONCE. A second timeout after the retry
+    is reported as a real error rather than looping forever.
+    """
+    literal = _osascript_string_literal(js)
+    script = (
+        'tell application "%s" to tell front window\'s active tab to execute javascript "%s"'
+        % (browser, literal)
+    )
+    try:
+        proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True,
+                               timeout=JS_EXEC_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        if _allow_retry:
+            run_jxa_key("escape", {})
+            time.sleep(0.3)
+            return _arc_execute_js(js, browser, _allow_retry=False)
+        return False, "", ("execute javascript timed out after %ss, twice in a row (sent Escape "
+                            "and retried once already) -- likely a native popup that Escape could "
+                            "not clear, or a genuinely hung page" % JS_EXEC_TIMEOUT_SECONDS)
+    return proc.returncode == 0, proc.stdout.strip(), proc.stderr.strip()
+
+
+def _arc_window_geometry(browser="Arc"):
+    win = run_jxa_ax("windows", {"app": browser})
+    if "error" in win or not win.get("windows"):
+        return None
+    # frontmost/content window: pick the widest one (Arc sometimes reports a
+    # slim companion window for its sidebar-collapse handle)
+    windows = sorted(win["windows"], key=lambda w: (w.get("w") or 0), reverse=True)
+    return windows[0]
+
+
+def _dom_element_extract_js(selector, limit, include_pointer_scan=False):
+    """
+    include_pointer_scan (Bug #5, additive-only): ALSO includes any
+    div/span/li/a with computed `cursor:pointer` that the CSS `selector`
+    didn't already match -- a plain `<div onclick-via-addEventListener>`
+    styled-component card has no attribute a CSS selector can catch, cursor
+    is the only observable signal. Bounded (first 800 candidates scanned)
+    to keep it cheap on a large page; only wired on when the CALLER is
+    using the default selector (see dom_query), never on an explicit
+    narrow --selector, so a caller asking for something specific doesn't
+    get surprise extra rows.
+    """
+    base = (
+        "Array.from(document.querySelectorAll(%s))"
+        ".map(function(el){var r=el.getBoundingClientRect();"
+        "return {el:el,tag:el.tagName,"
+        "text:(el.innerText||el.value||el.placeholder||'').trim().slice(0,80),"
+        "x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),"
+        "w:Math.round(r.width),h:Math.round(r.height)};})"
+    ) % json.dumps(selector)
+    if include_pointer_scan:
+        pointer_scan = (
+            "Array.from(document.querySelectorAll('div,span,li,a')).slice(0,800)"
+            ".filter(function(el){try{return window.getComputedStyle(el).cursor==='pointer';}"
+            "catch(e){return false;}})"
+            ".map(function(el){var r=el.getBoundingClientRect();"
+            "return {el:el,tag:el.tagName,"
+            "text:(el.innerText||el.value||el.placeholder||'').trim().slice(0,80),"
+            "x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),"
+            "w:Math.round(r.width),h:Math.round(r.height)};})"
+        )
+        combined = (
+            "(function(){var seen=new Set();var primary=%s;"
+            "primary.forEach(function(e){seen.add(e.el);});"
+            "var extra=%s.filter(function(e){return !seen.has(e.el);});"
+            "return primary.concat(extra);})()"
+        ) % (base, pointer_scan)
+    else:
+        combined = base
+    return (
+        "JSON.stringify(%s"
+        ".map(function(e){return {tag:e.tag,text:e.text,x:e.x,y:e.y,w:e.w,h:e.h};})"
+        ".filter(function(e){return e.w>0&&e.h>0;}).slice(0,%d))"
+    ) % (combined, limit)
+
+
+CLIPBOARD_RELAY_SENTINEL = "DESKTOP_AX_DOM_V1:"
+
+
+def _clipboard_read_text():
+    """Best-effort read of the current clipboard as text; None if not text."""
+    r = subprocess.run(["osascript", "-e", "the clipboard as text"],
+                        capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return r.stdout[:-1] if r.stdout.endswith("\n") else r.stdout
+
+
+def _clipboard_write_text(text):
+    literal = text.replace("\\", "\\\\").replace('"', '\\"')
+    subprocess.run(["osascript", "-e", 'set the clipboard to "%s"' % literal],
+                    capture_output=True, text=True)
+
+
+def _dom_via_clipboard_relay(selector, limit, browser):
+    """
+    Fallback path when `execute javascript`'s direct return is empty: have
+    the page write its JSON into a hidden textarea, copy it, and read it
+    back from the system clipboard. This CLOBBERS whatever the user last
+    copied, so it saves the prior clipboard first and restores it after
+    (best-effort: if the prior clipboard held something non-text, e.g. an
+    image, it can't be round-tripped through `the clipboard as text` and is
+    left as-is rather than destroyed with a wrong value).
+
+    A sentinel prefix is written along with the payload and checked on
+    read, if it's missing, either the copy silently failed or something
+    else raced onto the clipboard between the write and the read, and this
+    returns an error instead of trying to parse stale/foreign clipboard
+    content as coordinates.
+    """
+    prior_clipboard = _clipboard_read_text()
+
+    inner = _dom_element_extract_js(selector, limit)
+    relay_js = (
+        "(function(){var ta=document.createElement('textarea');"
+        "ta.value=%s+(%s);document.body.appendChild(ta);ta.select();"
+        "document.execCommand('copy');document.body.removeChild(ta);return true;})()"
+    ) % (json.dumps(CLIPBOARD_RELAY_SENTINEL), inner)
+
+    ok, _out, err = _arc_execute_js(relay_js, browser)
+    if not ok:
+        return None, {"error": "clipboard relay javascript failed: " + err}
+
+    clip_text = _clipboard_read_text()
+
+    if prior_clipboard is not None:
+        _clipboard_write_text(prior_clipboard)
+    # if prior_clipboard was None (non-text or empty), leave the clipboard
+    # as-is rather than guess a restore value.
+
+    if clip_text is None or not clip_text.startswith(CLIPBOARD_RELAY_SENTINEL):
+        return None, {"error": "clipboard relay verification failed (sentinel missing, "
+                                "stale or foreign clipboard content)"}
+
+    return clip_text[len(CLIPBOARD_RELAY_SENTINEL):], None
+
+
+def _screen_backing_scale_factor(ax_frame=None):
+    """
+    The OS-level Retina backing scale factor (1.0 on a non-retina display,
+    2.0 on a retina one) of the screen that ACTUALLY CONTAINS the browser
+    window, completely independent of any browser's page zoom. This is the
+    baseline `dom`'s zoom-normalization divides window.devicePixelRatio by
+    (see dom_query()'s docstring).
+
+    MULTI-MONITOR CORRECTNESS (P2 fix): this used to unconditionally read
+    NSScreen.mainScreen's backingScaleFactor. On a setup running a retina
+    built-in panel (2x) alongside a 1x external display simultaneously
+    (a retina built-in plus a 1x external), that's only correct when the browser window
+    happens to be on whichever display macOS currently calls "main" -- if
+    Arc's window is on the OTHER display, mainScreen's scale is wrong by a
+    factor of 2x/0.5x, EVEN AT 100% ZOOM, and every derived `dom` coordinate
+    is off by the same factor despite a perfectly good calibration.
+
+    Fix: pass the window's own center point (in quartz/AX screen space --
+    origin top-left of the primary display, y increasing downward, same
+    space AX window positions use) to _ax.js's `screen` command, which
+    finds which NSScreen.screens entry's frame actually contains that point
+    and returns THAT screen's backing scale.
+
+    ax_frame is the AX-reported window frame (Fix #1 ground truth, see
+    _viewport_to_screen) -- window.screenX/screenY/outerWidth/outerHeight
+    are NEVER used for this center point: under a hardware-mirrored display
+    they report (0,0) plus the full mirrored display's size, which would
+    resolve to the wrong screen (or the right screen for the wrong reason)
+    on exactly the setup this fix targets.
+
+    Returns (backing_scale, trustworthy, screen_index):
+      - backing_scale: the resolved factor, or None if the query failed
+        outright (caller should skip zoom-normalization rather than divide
+        by a guess, same as before this fix).
+      - trustworthy: True only when a screen was matched by genuinely
+        containing the window's position. False when there was no window
+        point to test (ax_frame missing) or the point matched no screen
+        (fell back to mainScreen as a last resort but can't vouch for it).
+        Per Codex review: a mis-identified screen is worse than skipping
+        zoom scaling, so callers MUST treat zoom_factor as untrustworthy
+        (fall back to 1.0, i.e. no scaling) rather than apply a guessed
+        scale, whenever this is False.
+      - screen_index: NSScreen.screens index that was matched/used, or
+        None if no lookup was possible (query failure).
+    """
+    at_args = {}
+    if ax_frame and ax_frame.get("x") is not None and ax_frame.get("y") is not None:
+        at_args = {
+            "atX": ax_frame["x"] + (ax_frame.get("w") or 0) / 2.0,
+            "atY": ax_frame["y"] + (ax_frame.get("h") or 0) / 2.0,
+        }
+    info = run_jxa_ax("screen", at_args)
+    if not isinstance(info, dict) or "backingScaleFactor" not in info or not info["backingScaleFactor"]:
+        return None, False, None
+    return info["backingScaleFactor"], bool(info.get("trustworthy")), info.get("screenIndex")
+
+
+def resolve_window_display(browser):
+    """
+    Generalizes _screen_backing_scale_factor() into the full display-aware
+    picture the real-click escalation primitive and the display-aware
+    calibration signature both need: WHICH display the browser window
+    actually sits on, that display's full frame (in quartz/AX point space,
+    same space cliclick/window.screenX all use), and whether the lookup is
+    trustworthy (see _screen_backing_scale_factor's docstring -- a
+    mis-identified screen is worse than not knowing, callers must not guess
+    on untrustworthy=False).
+
+    Returns None if the window frame can't be read at all (browser not
+    running / no window). Never assumes display 1 -- always resolves by the
+    window's own center point, taken from the AX frame (Fix #1 ground
+    truth), NEVER from window.screenX/screenY/outerWidth/outerHeight (the JS
+    self-report, which misreports the full mirrored display's origin/size
+    under a hardware-mirrored multi-display setup).
+    """
+    ax_frame = _arc_window_geometry(browser)
+    if not ax_frame:
+        return None
+    at_args = {
+        "atX": ax_frame["x"] + (ax_frame.get("w") or 0) / 2.0,
+        "atY": ax_frame["y"] + (ax_frame.get("h") or 0) / 2.0,
+    }
+    info = run_jxa_ax("screen", at_args)
+    if not isinstance(info, dict) or "widthPoints" not in info:
+        return None
+    return {
+        "screenIndex": info.get("screenIndex"),
+        "originXQuartz": info.get("originXQuartz"),
+        "originYQuartz": info.get("originYQuartz"),
+        "widthPoints": info.get("widthPoints"),
+        "heightPoints": info.get("heightPoints"),
+        "backingScale": info.get("backingScaleFactor"),
+        "trustworthy": bool(info.get("trustworthy")),
+        "windowX": ax_frame["x"], "windowY": ax_frame["y"],
+        "windowW": ax_frame.get("w"), "windowH": ax_frame.get("h"),
+    }
+
+
+def _dom_window_metrics(browser):
+    win_info_js = (
+        "JSON.stringify({outerW:window.outerWidth,outerH:window.outerHeight,"
+        "innerW:window.innerWidth,innerH:window.innerHeight,"
+        "screenX:window.screenX,screenY:window.screenY,dpr:window.devicePixelRatio})"
+    )
+    ok, winout, _ = _arc_execute_js(win_info_js, browser)
+    if not ok:
+        return None
+    try:
+        return json.loads(json.loads(winout) if winout.startswith('"') else winout)
+    except ValueError:
+        return None
+
+
+def dom_query(browser, selector, limit, top_chrome_override=None, left_chrome_override=None):
+    """
+    Extract visible interactive elements from the active tab's DOM.
+
+    Returns dict with:
+      - elements: list of {tag, text, vx, vy, vw, vh (viewport-relative),
+                            x, y (ABSOLUTE SCREEN coords, best-effort)}
+      - windowMetrics / windowGeometry: the raw numbers used to derive
+        absolute coords, so a caller can sanity-check or recompute.
+      - topChrome / topChromeCalibrated / topChromeSource / topChromeStale:
+        see get_top_chrome().
+      - leftChrome / leftChromeCalibrated / leftChromeSource / leftChromeStale:
+        see get_left_chrome().
+
+    ABSOLUTE COORDINATE DERIVATION:
+      window.screenX/screenY (JS) matches the AX window position exactly (both
+      are in the same point space on this 1x display -- verified live: Arc's
+      AX window position was x=1351,y=0 and JS window.screenX/screenY was also
+      1351,0).
+
+      Both axes now work IDENTICALLY, each via its own single calibrated
+      offset rather than the outerW/innerW or outerH/innerH deltas:
+        absScreenX = windowX + left_chrome + viewportX
+        absScreenY = windowY + top_chrome  + viewportY
+
+      This function originally used (outerW - innerW) directly as the X
+      offset (assuming Arc's whole left sidebar width equals that delta) and
+      (outerH - innerH) directly as the Y offset (assuming that whole delta
+      is top chrome). A live `calibrate` run proved BOTH assumptions wrong:
+      Y clicks landed a bar-height too low (fixed by top_chrome in an
+      earlier revision), and once that was live-tested, X clicks landed
+      ~90pt too far right (modeled left chrome 327 vs real 417), the
+      outerW-innerW delta undershoots Arc's real chrome width. `left_chrome`
+      is now resolved by get_left_chrome() exactly like `top_chrome` is by
+      get_top_chrome(): an explicit --left-chrome override, a previously
+      `calibrate`-measured value from .calibration.json (only if the
+      window's WIDTH chrome delta hasn't changed since), or an UNCALIBRATED
+      default guess (that same outerW-innerW delta, now clearly marked as
+      not to be trusted). Always check `topChromeCalibrated` AND
+      `leftChromeCalibrated` before trusting a derived point for anything
+      that matters. Run `calibrate` once the desktop is free to measure both
+      for real, it corrects both axes from a single click.
+
+    ZOOM NORMALIZATION:
+      getBoundingClientRect() (what el.x/el.y come from) returns coordinates
+      in the page's CSS-pixel LAYOUT VIEWPORT, which Chromium rescales at
+      any browser zoom level other than 100% -- at 110% zoom the same
+      physical window shows FEWER CSS px (innerWidth shrinks), so a CSS-px
+      viewport offset needs to be scaled UP to reach the right PHYSICAL
+      screen point, while `top_chrome`/`left_chrome` (real OS window chrome,
+      set once by `calibrate`) do NOT scale with page zoom at all.
+
+      The scale factor is window.devicePixelRatio (captured in
+      windowMetrics.dpr) divided by NSScreen.backingScaleFactor (queried
+      live via _screen_backing_scale_factor(), NOT hardcoded): Chromium
+      reports dpr = deviceScaleFactor * zoomLevel, so dividing out the
+      OS-level deviceScaleFactor isolates the zoom-only component. Verified
+      live on this 1x/non-retina display: at 100% zoom dpr=1 and
+      backingScaleFactor=1 -> zoomFactor=1 (and a live mousemove-readback
+      test confirmed the resulting absolute point lands exactly on target,
+      0px error, at that zoom level); at 110% zoom (Cmd+=) dpr measured
+      1.100000023841858 with backingScaleFactor still 1 -> zoomFactor=1.1,
+      matching Chromium's documented dpr=deviceScale*zoom behavior exactly.
+      On a retina display backingScaleFactor would read 2,
+      so 100%-zoom dpr=2 -> zoomFactor=1 there too, and 110% zoom would
+      report dpr=2.2 -> zoomFactor=1.1 again, same formula, no per-display
+      special-casing needed.
+
+      absScreenX = windowX + left_chrome + viewportX * zoomFactor
+      absScreenY = windowY + top_chrome  + viewportY * zoomFactor
+
+      `zoomFactor`/`browserDpr`/`backingScaleFactor` are included in the
+      result for debugging. If the backing-scale query fails, zoomFactor
+      falls back to 1.0 (unscaled) rather than guessing.
+
+      MULTI-MONITOR: `backingScaleFactor` is read from whichever display
+      the browser window's own center point actually falls on (see
+      _screen_backing_scale_factor()), not NSScreen.mainScreen -- a
+      retina built-in used alongside a 1x external otherwise mis-scales
+      zoomFactor by 2x/0.5x when the window is on the non-main display.
+      `zoomScaleTrustworthy` and `backingScaleScreenIndex` are included in
+      the result: if the window-containing screen could not be determined,
+      `zoomFactor` is forced to 1.0 (no scaling applied) rather than risk
+      using the wrong screen's scale.
+    """
+    if not _is_app_running(browser):
+        return {"error": "%s is not running -- dom will not auto-launch a browser, "
+                          "open it first" % browser}
+
+    # Only add the cursor:pointer pass when the caller is using the (now
+    # widened) default selector -- an explicit --selector is a deliberate
+    # narrowing, honor it as-is (see _dom_element_extract_js docstring).
+    js = _dom_element_extract_js(selector, limit, include_pointer_scan=(selector == DEFAULT_DOM_SELECTOR))
+    ok, out, err = _arc_execute_js(js, browser)
+    used_clipboard = False
+
+    if not ok or not out or out in ("missing value", ""):
+        out, relay_err = _dom_via_clipboard_relay(selector, limit, browser)
+        if relay_err:
+            combined = dict(relay_err)
+            combined["error"] = "execute javascript failed (direct: %s; %s)" % (err, relay_err["error"])
+            return combined
+        used_clipboard = True
+
+    # AppleScript prints a JSON string as a quoted, escaped literal -- that
+    # literal is itself valid JSON for a string, so decode twice.
+    try:
+        inner_json_str = json.loads(out) if out.startswith('"') else out
+        elements = json.loads(inner_json_str)
+    except ValueError as e:
+        return {"error": "could not parse DOM JSON: %s (raw: %s)" % (e, out[:300])}
+
+    # ax_frame (the AX-reported window frame) is the SINGLE ground truth for
+    # window origin/size (Fix #1) -- win_metrics (the JS self-report) is
+    # kept only for innerW/innerH (viewport size) and dpr, NEVER for
+    # screenX/screenY/outerW/outerH, which misreport the full mirrored
+    # display's origin/size under a hardware-mirrored multi-display setup.
+    ax_frame = _arc_window_geometry(browser)
+    win_metrics = _dom_window_metrics(browser)
+    geometry_agrees, geometry_detail = _check_js_geometry_against_ax(win_metrics, ax_frame)
+    if geometry_agrees is False:
+        # Never fall back to the JS numbers silently -- ax_frame is already
+        # what's used below regardless, this is purely so a caller/log can
+        # see the corrupted-JS-geometry case explicitly.
+        geometry_detail = dict(geometry_detail)
+        geometry_detail["note"] = ("window.screenX/screenY/outerWidth/outerHeight disagree with "
+                                    "the AX window frame beyond tolerance -- JS self-report "
+                                    "REJECTED, using AX frame as ground truth (Fix #1)")
+
+    # Zoom normalization + display resolution share one AX "screen" lookup
+    # (_screen_backing_scale_factor), so it's resolved BEFORE top/left chrome
+    # -- both the zoomFactor below and the calibration display/backing-scale
+    # staleness check (get_top_chrome/get_left_chrome) need it.
+    backing_scale, zoom_scale_trustworthy, backing_scale_screen_index = \
+        _screen_backing_scale_factor(ax_frame)
+    # Only feed a screen_index/backing_scale into the calibration staleness
+    # check when the lookup is actually trustworthy -- an untrustworthy
+    # guess would otherwise force every calibration stale for the wrong
+    # reason.
+    display_index_for_staleness = backing_scale_screen_index if zoom_scale_trustworthy else None
+    backing_scale_for_staleness = backing_scale if zoom_scale_trustworthy else None
+
+    top_chrome, top_chrome_calibrated, top_chrome_source, top_chrome_stale = \
+        get_top_chrome(browser, ax_frame, win_metrics, top_chrome_override,
+                       display_index_for_staleness, backing_scale_for_staleness)
+    left_chrome, left_chrome_calibrated, left_chrome_source, left_chrome_stale = \
+        get_left_chrome(browser, ax_frame, win_metrics, left_chrome_override,
+                        display_index_for_staleness, backing_scale_for_staleness)
+
+    # Zoom normalization: getBoundingClientRect() coordinates are in the
+    # page's CSS-pixel layout viewport, which Chromium rescales at any page
+    # zoom other than 100%. window.devicePixelRatio / NSScreen.
+    # backingScaleFactor isolates the zoom-only component (see docstring
+    # above for the verified derivation). Falls back to 1.0 (unscaled,
+    # today's pre-fix behavior) if either input is unavailable, rather than
+    # guessing.
+    browser_dpr = win_metrics.get("dpr") if win_metrics else None
+    zoom_factor = 1.0
+    if browser_dpr and backing_scale and zoom_scale_trustworthy:
+        zoom_factor = browser_dpr / backing_scale
+
+    result_elements = []
+    base_x = base_y = None
+    if ax_frame:
+        base_x = ax_frame["x"]
+        base_y = ax_frame["y"]
+
+    for el in elements:
+        item = {
+            "tag": el.get("tag"), "text": el.get("text"),
+            "vx": el.get("x"), "vy": el.get("y"),
+            "vw": el.get("w"), "vh": el.get("h"),
+        }
+        if base_x is not None:
+            item["x"], item["y"] = _viewport_to_screen(
+                ax_frame, top_chrome, left_chrome, zoom_factor,
+                el.get("x", 0), el.get("y", 0))
+        result_elements.append(item)
+
+    return {
+        "browser": browser,
+        "usedClipboardFallback": used_clipboard,
+        "windowMetrics": win_metrics,
+        "windowGeometry": ax_frame,
+        "jsGeometryAgreesWithAx": geometry_agrees,
+        "jsGeometryCheck": geometry_detail,
+        "topChrome": top_chrome,
+        "topChromeCalibrated": top_chrome_calibrated,
+        "topChromeSource": top_chrome_source,
+        "topChromeStale": top_chrome_stale,
+        "leftChrome": left_chrome,
+        "leftChromeCalibrated": left_chrome_calibrated,
+        "leftChromeSource": left_chrome_source,
+        "leftChromeStale": left_chrome_stale,
+        "browserDpr": browser_dpr,
+        "backingScaleFactor": backing_scale,
+        "backingScaleScreenIndex": backing_scale_screen_index,
+        "zoomScaleTrustworthy": zoom_scale_trustworthy,
+        "zoomFactor": zoom_factor,
+        "elements": result_elements,
+    }
+
+
+def cmd_dom(args):
+    out = dom_query(args.app, args.selector, args.limit, args.top_chrome, args.left_chrome)
+    print(json.dumps(out))
+    # Loud guard (2026-09-01): both real incidents happened with these two
+    # booleans sitting in the JSON, correctly False->stale, and nobody
+    # looked. Nothing about a caller reading `dom`'s JSON forces them to
+    # check topChromeStale/leftChromeStale, so print a stderr warning any
+    # time either is true -- cheap, and it doesn't touch stdout/exit code
+    # so it can't break a caller parsing the JSON.
+    if out.get("topChromeStale") or out.get("leftChromeStale"):
+        sys.stderr.write(
+            "WARNING: coordinates in this dom output are UNCALIBRATED for the current window "
+            "state (topChromeStale=%s source=%s, leftChromeStale=%s source=%s) -- run "
+            "`desktop calibrate --app %s` before trusting clicks derived from it\n"
+            % (out.get("topChromeStale"), out.get("topChromeSource"),
+               out.get("leftChromeStale"), out.get("leftChromeSource"), args.app)
+        )
+    if "error" in out:
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# real_click_verified: the ONE real-OS-mouse escalation primitive. Every
+# other verb that needs an actual click (select's combobox commit, click's
+# web fallback, fill's hand-to-human real-key attempt) routes through this,
+# so the activate-first fix and the bounds guard only ever need to live in
+# one place.
+#
+# Coordinates come from THE SAME _viewport_to_screen() formula dom_query
+# uses (never a second, independently-drifting formula) -- that's the whole
+# point of extracting it: a reader and a clicker that agree by construction.
+# ---------------------------------------------------------------------------
+
+def real_click_verified(browser, rect, verify_fn):
+    """
+    rect: {"vx","vy","vw","vh"} in the page's CSS-pixel viewport (as
+    returned by getBoundingClientRect()), the SAME shape dom_query/_dom
+    element extraction already produces. Clicks the rect's CENTER.
+
+    verify_fn: a zero-arg callable returning (verified: bool,
+    verified_by: str|None, detail: any) -- caller-supplied so this stays
+    uniform across every use (combobox commit verify, click signature diff,
+    fill focus check).
+
+    Sequence (Bug #3's activate-first fix is the one change that mattered
+    for the external-monitor intermittency): resolve which display the
+    window is actually on, compute the absolute screen point, REFUSE if
+    it's outside both the window rect and the resolved display frame
+    (never click blind), activate the browser FIRST and let that settle
+    (defeats macOS's click-to-focus swallowing the actuating click when the
+    app wasn't already frontmost), THEN cliclick, THEN call verify_fn.
+
+    Returns an envelope-shaped dict: {ok, verified, verifiedBy, method:
+    "real-click", coords:{x,y,display}, reason, detail}. ok is set iff
+    verified is True (section 4's `ok == verified` invariant).
+
+    Fix #1 (Asclepius QA finding, hardware-mirrored display): the AX window
+    frame (from `windows --app <browser>`) is the SINGLE ground truth for
+    window origin/size here. window.screenX/screenY/outerWidth/outerHeight
+    (the JS self-report, still read via _dom_window_metrics for innerW/
+    innerH/dpr) are NEVER trusted for positioning -- under a hardware
+    mirror (built-in panel mirroring an external ultrawide) Chromium reports
+    those as (0,0,fullMirroredDisplayW,fullMirroredDisplayH) instead of the
+    real window frame, which silently sent every computed click to the
+    wrong point. `jsGeometryCheck` in the returned dict cross-checks the two
+    sources (belt-and-suspenders guard) but never changes which numbers get
+    used -- see _check_js_geometry_against_ax().
+    """
+    ax_frame = _arc_window_geometry(browser)
+    if not ax_frame:
+        return {"ok": False, "verified": False, "verifiedBy": None, "method": "real-click",
+                "coords": None, "reason": "no-window-frame", "jsGeometryCheck": None,
+                "detail": "could not read %s's AX window frame, refusing to click blind" % browser}
+
+    win_metrics = _dom_window_metrics(browser)
+    geometry_agrees, geometry_detail = _check_js_geometry_against_ax(win_metrics, ax_frame)
+    if geometry_agrees is False:
+        geometry_detail = dict(geometry_detail)
+        geometry_detail["note"] = ("window.screenX/screenY/outerWidth/outerHeight disagree with "
+                                    "the AX window frame beyond tolerance -- JS self-report "
+                                    "REJECTED, using AX frame as ground truth (Fix #1)")
+
+    display = resolve_window_display(browser)
+    top_chrome, _tcal, _tsrc, _tstale = get_top_chrome(browser, ax_frame, win_metrics, None)
+    left_chrome, _lcal, _lsrc, _lstale = get_left_chrome(browser, ax_frame, win_metrics, None)
+    backing_scale, zoom_trustworthy, _idx = _screen_backing_scale_factor(ax_frame)
+    browser_dpr = win_metrics.get("dpr") if win_metrics else None
+    zoom_factor = 1.0
+    if browser_dpr and backing_scale and zoom_trustworthy:
+        zoom_factor = browser_dpr / backing_scale
+
+    center_vx = rect.get("vx", 0) + rect.get("vw", 0) / 2.0
+    center_vy = rect.get("vy", 0) + rect.get("vh", 0) / 2.0
+    abs_x, abs_y = _viewport_to_screen(ax_frame, top_chrome, left_chrome, zoom_factor,
+                                        center_vx, center_vy)
+
+    win_w = ax_frame.get("w") or 0
+    win_h = ax_frame.get("h") or 0
+    in_window = (ax_frame["x"] <= abs_x <= ax_frame["x"] + win_w
+                 and ax_frame["y"] <= abs_y <= ax_frame["y"] + win_h)
+    in_display = False
+    if display and display.get("originXQuartz") is not None:
+        in_display = (display["originXQuartz"] <= abs_x <= display["originXQuartz"] + display["widthPoints"]
+                      and display["originYQuartz"] <= abs_y <= display["originYQuartz"] + display["heightPoints"])
+    coords = {"x": abs_x, "y": abs_y, "display": display.get("screenIndex") if display else None}
+    if not in_window and not in_display:
+        return {"ok": False, "verified": False, "verifiedBy": None, "method": "real-click",
+                "coords": coords, "reason": "point-out-of-bounds",
+                "jsGeometryAgreesWithAx": geometry_agrees, "jsGeometryCheck": geometry_detail,
+                "detail": ("computed click point (%d,%d) falls outside both the window rect "
+                            "and the resolved display frame, refused before clicking" % (abs_x, abs_y))}
+
+    # Activate-first (Bug #3's intermittency fix): when Arc wasn't already
+    # frontmost, the FIRST synthetic click only raised the window (macOS's
+    # own click-to-focus swallowed the actuating click). Explicitly
+    # activating and letting it settle before clicking defeats that.
+    run_jxa_ax("activate", {"app": browser})
+    time.sleep(0.12)
+
+    click_out = cliclick("c:%d,%d" % (abs_x, abs_y))
+    if "error" in click_out:
+        return {"ok": False, "verified": False, "verifiedBy": None, "method": "real-click",
+                "coords": coords, "reason": "cliclick-failed", "detail": click_out["error"],
+                "jsGeometryAgreesWithAx": geometry_agrees, "jsGeometryCheck": geometry_detail}
+
+    time.sleep(0.15)
+    verified, verified_by, detail = verify_fn()
+    return {
+        "ok": bool(verified), "verified": bool(verified),
+        "verifiedBy": verified_by if verified else None,
+        "method": "real-click", "coords": coords,
+        "reason": None if verified else "not-verified-after-real-click",
+        "detail": detail,
+        "jsGeometryAgreesWithAx": geometry_agrees,
+        "jsGeometryCheck": geometry_detail,
+    }
+
+
+# ---------------------------------------------------------------------------
+# set-select: set a dropdown's value via JS -- no click, no keystroke to open
+# a native OS popup that CGEvents can't drive and that jams the page's JS
+# thread while open (see JS_EXEC_TIMEOUT_SECONDS / _arc_execute_js).
+#
+# Handles TWO distinct widget families, auto-detected by the resolved
+# element's tag:
+#   1. Native <select>: set .value via the native property setter + dispatch
+#      input/change. No click needed, so the native OS popup never opens.
+#   2. ARIA/custom combobox (confirmed live on a real web form's
+#      an ARIA-role dropdown step: document.querySelectorAll('select')
+#      returned ZERO matches even though a dropdown showing "No" was
+#      visibly present -- some sites' custom dropdowns are a styled
+#      role=combobox/listbox widget, not a native <select>). These are
+#      page-rendered JS/CSS, so dispatched click events work on them: click
+#      the trigger, poll for the option list to render, click the matching
+#      option.
+#
+# THIS IS A REWRITE (Athena hardening spec, ends a 4-round whack-a-mole).
+# The load-bearing change from every prior version: NEVER return success
+# without an OBSERVED state transition, and REFUSE rather than guess on
+# ambiguity. Every result carries a `status` field from a closed enum (see
+# STATUS_* constants below); `status == "ok"` is the only success value, and
+# it requires a re-read confirming the field/trigger actually moved, not
+# just that a click was dispatched.
+#
+# Result shape: every returned dict has a `status` key. On success (`ok`)
+# it also carries `mode` ("native-select" or "combobox"), `containerSource`
+# (combobox only), `selectedText`, and `verifiedBy` (how the transition was
+# confirmed: "text" | "aria-selected" | "form-field" | "native-readback").
+# On any other status it names what it saw: `optionsSeen`, `containerSource`,
+# `matchCount`, `candidates`, or a `detail`/`reason` string -- never a bare
+# failure with no context, so a caller can adjust --value/--selector/--name
+# instead of re-running blind.
+#
+# STATUS ENUM:
+#   ok                   verified transition; the ONLY exit-0 status.
+#   unverified            clicked/set but no confirmed transition (including
+#                         a menu that merely closed -- aria-expanded going
+#                         true->false ALONE is a WEAK signal, not proof the
+#                         value changed, since some widgets close on any
+#                         outside interaction). NONZERO exit: an autonomous
+#                         apply run must not treat "maybe" as "done".
+#   no-match              container resolved+opened, no visible option
+#                         matched --value; optionsSeen + containerSource.
+#   ambiguous              refused rather than guessed: >1 exact visible
+#                         match with no unique value/selector to disambiguate,
+#                         or the trigger's own popup container could not be
+#                         identified; candidates listed.
+#   menu-did-not-open     poll ceiling hit, no candidates ever rendered;
+#                         Escape sent.
+#   error                  structural failure: target lost mid-flow,
+#                         execute-javascript itself failed/timed out, JSON
+#                         parse failure, or (see `crossOriginIframeDetected`)
+#                         the target may be inside a cross-origin iframe,
+#                         which `execute javascript` cannot reach at all
+#                         (contentDocument access throws by design -- this is
+#                         detected and reported, never silently swallowed).
+#
+# Every exit path -- success or not -- clears every `data-atlas-*` marker
+# this command plants (select-target, preopen, picked, pretext, preexpanded,
+# prefieldval, typed) via a dedicated cleanup pass, and sends Escape on any
+# non-ok status so a partially-open menu never gets left hanging.
+#
+# OUT OF SCOPE (detected + reported, not attempted):
+#   - Cross-origin iframe listboxes: contentDocument access throws by
+#     design; reported via crossOriginIframeDetected, never worked around.
+#   - isTrusted-hardened widgets that require a genuine OS-level click:
+#     these will surface as `unverified`, not a crash.
+#   - Same-origin iframe walking (OPTIONAL per spec): NOT implemented --
+#     every one of the JS calls below would need to search inside same-
+#     origin iframes too (marker placement, container resolution, verify),
+#     which is not "cheap" once threaded through every phase. Left as a
+#     residual risk (see README).
+# ---------------------------------------------------------------------------
+
+DEFAULT_SET_SELECT_SELECTOR = (
+    "select,[role=combobox],[aria-haspopup=listbox],[aria-haspopup=true],"
+    "button[aria-expanded][aria-controls]"
+)
+
+# Predicate helpers shared by every combobox-phase JS payload below. Inlined
+# into each IIFE (each `execute javascript` call is a fresh, stateless
+# evaluation -- nothing is shared across calls except the DOM itself).
+_PREDICATES_JS = (
+    "function normalize(t){return (t||'').replace(/\\s+/g,' ').trim().toLowerCase();}"
+    "function isVisible(el){"
+    "if(!el)return false;"
+    "if(el.closest('[aria-hidden=\"true\"]'))return false;"
+    "var st=window.getComputedStyle(el);"
+    "if(st.display==='none'||st.visibility==='hidden')return false;"
+    "if(el.getClientRects().length===0)return false;"
+    "var r=el.getBoundingClientRect();"
+    "return r.width>0&&r.height>0;}"
+    "function isEnabled(el){"
+    "if(el.disabled)return false;"
+    "if(el.getAttribute('aria-disabled')==='true')return false;"
+    "return true;}"
+    "function isLeaf(el,sel){return el.matches(sel)&&!el.querySelector(sel);}"
+)
+
+# All markers this command ever plants on the page, for the stale-sweep at
+# the top of resolve and the central cleanup pass at the end of every run.
+_ATLAS_MARKER_ATTRS = [
+    "data-atlas-select-target", "data-atlas-preopen", "data-atlas-picked",
+    "data-atlas-pretext", "data-atlas-preexpanded", "data-atlas-prefieldval",
+    "data-atlas-typed",
+]
+
+
+_CSS_IDENT_RE = re.compile(r"^-?[_a-zA-Z][_a-zA-Z0-9-]*$")
+
+
+def _normalize_selector(selector):
+    """`#9b56ca6c-...` is NOT a valid CSS selector: an id selector may not start
+    with a digit. Some form platforms mint UUID field ids, so this is the
+    common case, not an edge case. querySelector throws on those, Arc returns
+    `null`, and every caller here used to crash on `None.get(...)`.
+
+    Rewrite a bare `#id` whose id is not a valid CSS identifier into the
+    equivalent `[id="..."]` attribute selector, which has no such restriction.
+    Anything else is passed through untouched.
+    """
+    if not selector.startswith("#") or len(selector) < 2:
+        return selector
+    ident = selector[1:]
+    # Only rewrite a plain single-id selector; leave compound/descendant
+    # selectors (`#a .b`, `#a>b`) alone rather than guess at their structure.
+    if any(c in ident for c in ' >+~[].#:,()'):
+        return selector
+    if _CSS_IDENT_RE.match(ident):
+        return selector
+    return '[id="%s"]' % ident.replace('\\', '\\\\').replace('"', '\\"')
+
+
+def _resolve_select_target_js(selector, name, index):
+    """
+    Phase 0 (unchanged structure). Finds the `index`-th visible element
+    matching `selector` (optionally filtered to ones whose name/id/
+    aria-label/associated-<label>-text/own text/ANCESTOR aria-label contains
+    `name` as a case-insensitive substring), tags it with a temporary
+    `data-atlas-select-target` marker so follow-up calls can address the
+    exact same element without re-resolving, and reports its tag/role so
+    the python caller can branch native-<select> vs combobox.
+
+    Sweeps ALL `data-atlas-*` markers this command ever plants (not just
+    select-target) before resolving, in case a prior run crashed mid-flow
+    and left cleanup incomplete.
+
+    `--name` now also walks up to 6 ancestor levels collecting any
+    `aria-label` found there -- closes the real gap the prior version had
+    (a container div's aria-label, not just the trigger's own, is a common
+    place production comboboxes put the accessible label).
+
+    On zero matches, also probes for cross-origin iframes on the page and
+    reports the hint (`execute javascript` can never reach inside one --
+    contentDocument access throws by design) rather than a bare "not found".
+    """
+    selector = _normalize_selector(selector)
+    sweep = "".join(
+        "document.querySelectorAll('[%s]').forEach(function(e){e.removeAttribute('%s');});"
+        % (attr, attr)
+        for attr in _ATLAS_MARKER_ATTRS
+    )
+    return (
+        "(function(){"
+        + sweep +
+        "var sel=%s;var nameWanted=(%s||'').toLowerCase();var idx=%d;"
+        "function labelText(el){var t='';try{"
+        "if(el.id){var lab=document.querySelector('label[for=\"'+CSS.escape(el.id)+'\"]');"
+        "if(lab)t+=' '+lab.innerText;}"
+        "var pl=el.closest('label');if(pl)t+=' '+pl.innerText;"
+        "var al=el.getAttribute('aria-labelledby');if(al){al.split(' ').forEach("
+        "function(id){var e2=document.getElementById(id);if(e2)t+=' '+e2.innerText;});}"
+        "var anc=el.parentElement;var hops=0;"
+        "while(anc&&hops<6){var al2=anc.getAttribute&&anc.getAttribute('aria-label');"
+        "if(al2)t+=' '+al2;anc=anc.parentElement;hops++;}"
+        "}catch(e){}return t;}"
+        "var cands=Array.from(document.querySelectorAll(sel)).filter(function(el){"
+        "var st=window.getComputedStyle(el);"
+        "if(st.display==='none'||st.visibility==='hidden')return false;"
+        "if(!nameWanted)return true;"
+        "var hay=((el.getAttribute('aria-label')||'')+' '+(el.id||'')+' '+(el.name||'')"
+        "+' '+labelText(el)+' '+(el.tagName==='SELECT'?'':el.textContent)).toLowerCase();"
+        "return hay.indexOf(nameWanted)!==-1;});"
+        "if(cands.length===0){"
+        "var iframes=Array.from(document.querySelectorAll('iframe'));"
+        "var crossOrigin=false;"
+        "for(var i=0;i<iframes.length;i++){try{var d=iframes[i].contentDocument;"
+        "if(!d)crossOrigin=true;}catch(e){crossOrigin=true;}}"
+        "return JSON.stringify({status:'error',reason:'no-target-match',"
+        "detail:'no element matched selector/name'"
+        "+(crossOrigin?' -- target may be inside a cross-origin iframe, unreachable via "
+        "execute-javascript':''),"
+        "crossOriginIframeDetected:crossOrigin,iframeCount:iframes.length});}"
+        "if(idx>=cands.length)return JSON.stringify({status:'error',reason:'index-out-of-range',"
+        "detail:'index out of range: only '+cands.length+' match(es) for that selector/name'});"
+        "var el=cands[idx];el.setAttribute('data-atlas-select-target','1');"
+        "return JSON.stringify({status:'resolved',tag:el.tagName,role:el.getAttribute('role'),"
+        "text:(el.tagName==='SELECT'?'':(el.textContent||'')).trim().slice(0,80),"
+        "candidatesMatched:cands.length});"
+        "})()"
+    ) % (json.dumps(selector), json.dumps(name or ""), index)
+
+
+def _cleanup_markers_js():
+    """Central marker-hygiene pass, run on EVERY exit from set_select()
+    regardless of which path/status was hit."""
+    sweep = "".join(
+        "document.querySelectorAll('[%s]').forEach(function(e){e.removeAttribute('%s');});"
+        % (attr, attr)
+        for attr in _ATLAS_MARKER_ATTRS
+    )
+    return "(function(){" + sweep + "return JSON.stringify({status:'cleaned'});})()"
+
+
+# --- Phase 2a: native <select> --------------------------------------------
+
+def _native_select_match_and_set_js(value):
+    """Matches `value` against the marked <select>'s options (exact
+    normalized text -> exact value -> substring text; >1 exact TEXT match
+    with no unique value is refused as ambiguous rather than guessed), then
+    sets it via the native property setter
+    (Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set)
+    and dispatches input+change (bubbling). A bare `el.value=` is silently
+    swallowed by React's controlled-component valueTracker -- it updates the
+    DOM but the framework's own tracker still thinks the old value is
+    current, so its onChange never fires. Going through the native setter
+    bypasses that shadowing exactly the way a real user interaction would.
+
+    Does NOT remove the marker or claim success here -- that's the verify
+    step's job, so a stale marker never masks a mismatch between "we called
+    the setter" and "the value actually stuck"."""
+    return (
+        "(function(){"
+        "function normalize(t){return (t||'').replace(/\\s+/g,' ').trim().toLowerCase();}"
+        "var el=document.querySelector('[data-atlas-select-target]');"
+        "if(!el)return JSON.stringify({status:'error',reason:'target-lost',"
+        "detail:'target element lost (page may have re-rendered)'});"
+        "var wanted=%s;var wl=normalize(wanted);"
+        "var options=Array.from(el.options).filter(function(o){return !o.disabled;});"
+        "var exact=options.filter(function(o){return normalize(o.textContent)===wl;});"
+        "var match=null;"
+        "if(exact.length>1){"
+        "var byValue=exact.filter(function(o){return o.value===wanted;});"
+        "if(byValue.length===1){match=byValue[0];}else{"
+        "return JSON.stringify({status:'ambiguous',reason:'multiple-exact-matches',"
+        "matchCount:exact.length,"
+        "candidates:exact.map(function(o){return {text:o.textContent.trim(),value:o.value};})});}"
+        "}else if(exact.length===1){match=exact[0];}"
+        "if(!match)match=options.find(function(o){return o.value===wanted;});"
+        "if(!match){"
+        "var sub=options.filter(function(o){return normalize(o.textContent).indexOf(wl)!==-1;});"
+        "if(sub.length>1){"
+        "return JSON.stringify({status:'ambiguous',reason:'multiple-substring-matches',"
+        "matchCount:sub.length,"
+        "candidates:sub.map(function(o){return {text:o.textContent.trim(),value:o.value};})});}"
+        "if(sub.length===1)match=sub[0];}"
+        "if(!match){return JSON.stringify({status:'no-match',"
+        "optionsSeen:options.map(function(o){return o.textContent.trim();}).slice(0,40)});}"
+        "var setter=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set;"
+        "setter.call(el,match.value);"
+        "el.dispatchEvent(new Event('input',{bubbles:true}));"
+        "el.dispatchEvent(new Event('change',{bubbles:true}));"
+        "return JSON.stringify({status:'set',matchedValue:match.value,"
+        "matchedText:match.textContent.trim(),matchedIndex:el.selectedIndex});"
+        "})()"
+    ) % json.dumps(value)
+
+
+def _native_select_verify_js(expected_value, expected_index):
+    """Re-reads the marked <select> after a tick: `ok` requires BOTH
+    `el.value===expected_value` AND `el.selectedIndex===expected_index`
+    (belt-and-braces -- value alone can't distinguish two options that
+    legitimately share a value attribute). Removes the marker either way;
+    this is the final exit point on the native path."""
+    return (
+        "(function(){"
+        "var el=document.querySelector('[data-atlas-select-target]');"
+        "if(el)el.removeAttribute('data-atlas-select-target');"
+        "if(!el)return JSON.stringify({status:'error',reason:'target-lost-after-set',"
+        "detail:'select element lost between setting the value and verifying it'});"
+        "var ok=(el.value===%s)&&(el.selectedIndex===%d);"
+        "return JSON.stringify({status:ok?'ok':'unverified',"
+        "reason:ok?undefined:'value-did-not-stick',"
+        "currentValue:el.value,currentIndex:el.selectedIndex,"
+        "currentText:(el.options[el.selectedIndex]?"
+        "el.options[el.selectedIndex].textContent.trim():'')});"
+        "})()"
+    ) % (json.dumps(expected_value), expected_index)
+
+
+def _set_select_native(browser, value):
+    ok, out, err = _arc_execute_js(_native_select_match_and_set_js(value), browser)
+    if not ok or not out:
+        return {"status": "error", "reason": "execute-js-failed",
+                "detail": "setting native select: " + (err or "empty result")}
+    try:
+        result = _parse_js_json(out)
+    except ValueError as e:
+        return {"status": "error", "reason": "json-parse-failed",
+                "detail": "native-select-set: %s (raw: %s)" % (e, out[:300])}
+    if result.get("status") in ("ambiguous", "no-match", "error"):
+        return result
+
+    time.sleep(0.05)  # let a controlled-component re-render settle before reading back
+    ok2, out2, err2 = _arc_execute_js(
+        _native_select_verify_js(result["matchedValue"], result["matchedIndex"]), browser)
+    if not ok2 or not out2:
+        return {"status": "error", "reason": "execute-js-failed",
+                "detail": "verifying native select: " + (err2 or "empty result")}
+    try:
+        verify = _parse_js_json(out2)
+    except ValueError as e:
+        return {"status": "error", "reason": "json-parse-failed",
+                "detail": "native-select-verify: %s (raw: %s)" % (e, out2[:300])}
+    verify["mode"] = "native-select"
+    if verify.get("status") == "ok":
+        verify["selectedText"] = result.get("matchedText")
+        verify["verifiedBy"] = "native-readback"
+    return verify
+
+
+# --- Phase 2b: ARIA/custom combobox ----------------------------------------
+
+def _combobox_open_js():
+    """Step 1: snapshot then open, in one call. BEFORE dispatching the open
+    click, tags every currently-visible [role=listbox]/[role=menu] with
+    data-atlas-preopen (so container tier 3 below can tell a NEWLY-appeared
+    popup from one that was already open elsewhere on the page), and records
+    the trigger's pre-click normalized text + aria-expanded + (best-effort)
+    linked form field value as data attributes, for the verify step to diff
+    against later. Then fires the same full pointerdown/mousedown/pointerup/
+    mouseup/click sequence used before: this is page-rendered JS/CSS, not an
+    OS-native popup, so dispatched (untrusted) events work -- most component
+    libraries attach their open-handler via addEventListener on click/
+    mousedown, which doesn't require event.isTrusted. Dispatched exactly
+    once; nothing below re-toggles it, so the poll loop can retry the SCAN
+    safely across the render race without re-opening/re-closing the menu."""
+    return (
+        "(function(){"
+        + _PREDICATES_JS +
+        "var trigger=document.querySelector('[data-atlas-select-target]');"
+        "if(!trigger)return JSON.stringify({status:'error',reason:'target-lost',"
+        "detail:'trigger element lost (page may have re-rendered)'});"
+        "Array.from(document.querySelectorAll('[role=\"listbox\"],[role=\"menu\"]'))"
+        ".filter(isVisible).forEach(function(el){el.setAttribute('data-atlas-preopen','1');});"
+        "trigger.setAttribute('data-atlas-pretext',"
+        "normalize(trigger.tagName==='INPUT'?trigger.value:trigger.textContent));"
+        "trigger.setAttribute('data-atlas-preexpanded',trigger.getAttribute('aria-expanded')||'');"
+        "var fieldScope=trigger.closest('[role=\"combobox\"]')||trigger.parentElement||trigger;"
+        "var field=fieldScope.querySelector('input[type=\"hidden\"],select')||"
+        "((trigger.tagName==='INPUT'||trigger.tagName==='SELECT')?trigger:null);"
+        "if(field)trigger.setAttribute('data-atlas-prefieldval',field.value);"
+        "var opts={bubbles:true,cancelable:true,view:window};"
+        "try{trigger.dispatchEvent(new PointerEvent('pointerdown',opts));}catch(e){}"
+        "trigger.dispatchEvent(new MouseEvent('mousedown',opts));"
+        "try{trigger.dispatchEvent(new PointerEvent('pointerup',opts));}catch(e){}"
+        "trigger.dispatchEvent(new MouseEvent('mouseup',opts));"
+        "trigger.dispatchEvent(new MouseEvent('click',opts));"
+        "if(trigger.focus)trigger.focus();"
+        "return JSON.stringify({status:'opened',triggerTag:trigger.tagName,"
+        "triggerText:(trigger.textContent||'').trim().slice(0,80)});"
+        "})()"
+    )
+
+
+def _combobox_scan_js(value, do_scroll, do_type):
+    """Step 2: ONE poll iteration. Pure read+match (only clicks the LEAF on
+    a committed match) so the python caller can call this repeatedly across
+    the render race without re-opening the menu (idempotent scan, single
+    open -- invariant 4).
+
+    Container resolution is ordered, refuses rather than falling back to a
+    document-global search. An unresolved container is reported as
+    pending/container-unresolved (NOT an immediate ambiguous) -- the popup
+    may simply not have mounted yet right after the open click, so the
+    python caller retries it across the same render-race poll as no-match,
+    and only finalizes it to status:'ambiguous' once it's stable across
+    consecutive polls or the ceiling is hit:
+      1. aria-controls/aria-owns id refs, visible, containing >=1
+         option-like descendant.
+      2. aria-activedescendant -> closest [role=listbox|menu].
+      3. A visible [role=listbox|menu] that LACKS data-atlas-preopen (i.e.
+         appeared after this trigger's own open click) -- replaces the old
+         fragile ~-sibling/bare-listbox tier, which could collide with an
+         unrelated already-open widget sharing the same option text.
+      4. The nearest visible [role=listbox|menu] descendant of the
+         trigger's own combobox root.
+      5. None resolved -> refuse, listing every visible listbox/menu seen.
+
+    Candidate gathering: primary option-role selectors first, filtered
+    visible+enabled+leaf (a leaf never contains another candidate --
+    a wrapper div around the real option is the same self-vs-descendant
+    problem one level down); only if that's empty does it fall back to
+    generic clickable descendants, same filter. Tiering is decided on the
+    VISIBLE primary count, not the raw querySelectorAll length, so a hidden
+    template/state-only primary node can't suppress a real visible fallback
+    option.
+
+    Zero candidates: if exactly one visible text input is in scope and
+    hasn't been typed into yet, types `value` (native setter + input event)
+    and reports pending/typed-filter so the caller re-polls. Else, once past
+    the sub-deadline, scrolls the container one page if scrollable and
+    reports pending/scrolled. Otherwise pending/rendering.
+
+    Match order (both non-empty-candidate paths): exact-normalized ==,
+    then startsWith, then substring. >1 EXACT visible match is refused as
+    ambiguous (never silently auto-picked); startsWith/substring ties pick
+    the first but report matchCount>1 so the caller can see the tie. Zero
+    matches at all reports pending/no-match-yet with optionsSeen -- the
+    python caller finalizes this to a real 'no-match' only once optionsSeen
+    is stable across two consecutive polls, so a still-rendering list isn't
+    prematurely declared a miss.
+
+    On a committed match, tags the leaf with data-atlas-picked (so verify
+    can re-find it even after the menu closes) and dispatches the same
+    click sequence _combobox_open_js used for the trigger."""
+    return (
+        "(function(){"
+        + _PREDICATES_JS +
+        "var wanted=%s;var wl=normalize(wanted);"
+        "var doScroll=%s;var doType=%s;"
+        "var trigger=document.querySelector('[data-atlas-select-target]');"
+        "if(!trigger)return JSON.stringify({status:'error',reason:'target-lost',"
+        "detail:'trigger element lost (page may have re-rendered)'});"
+        "var primarySel='[role=\"option\"],option,[role=\"menuitem\"],[role=\"menuitemradio\"]';"
+        "var fallbackSel='li,button,div,.artdeco-typeahead__result,[data-test-typeahead-result]';"
+        "function idsFrom(attr){var v=trigger.getAttribute(attr);"
+        "return v?v.split(/\\s+/).filter(Boolean):[];}"
+        "var container=null,containerSource=null;"
+        "var ownerIds=idsFrom('aria-controls').concat(idsFrom('aria-owns'));"
+        "for(var i=0;i<ownerIds.length&&!container;i++){"
+        "var c=document.getElementById(ownerIds[i]);"
+        "if(c&&isVisible(c)&&(c.querySelector(primarySel)||c.querySelector(fallbackSel))){"
+        "container=c;containerSource='aria-controls/owns';}}"
+        "if(!container){"
+        "var activeId=trigger.getAttribute('aria-activedescendant');"
+        "if(activeId){var ad=document.getElementById(activeId);"
+        "if(ad){var lb=ad.closest('[role=\"listbox\"],[role=\"menu\"]');"
+        "if(lb){container=lb;containerSource='aria-activedescendant';}}}}"
+        "if(!container){"
+        "var newlyOpened=Array.from(document.querySelectorAll('[role=\"listbox\"],[role=\"menu\"]'))"
+        ".filter(function(el){return isVisible(el)&&!el.hasAttribute('data-atlas-preopen');});"
+        "if(newlyOpened.length===1){container=newlyOpened[0];containerSource='newly-opened';}}"
+        "if(!container){"
+        "var root=trigger.closest('[role=\"combobox\"]')||trigger.parentElement;"
+        "if(root){var found=Array.from(root.querySelectorAll('[role=\"listbox\"],[role=\"menu\"]'))"
+        ".filter(isVisible);"
+        "if(found.length===1){container=found[0];containerSource='trigger-root-descendant';}}}"
+        "if(!container){"
+        "var openSeen=Array.from(document.querySelectorAll('[role=\"listbox\"],[role=\"menu\"]'))"
+        ".filter(isVisible).map(function(el){return {role:el.getAttribute('role'),"
+        "text:normalize(el.textContent).slice(0,60)};});"
+        "return JSON.stringify({status:'pending',reason:'container-unresolved',"
+        "candidates:openSeen});}"
+        "function gather(sel){return Array.from(container.querySelectorAll(sel))"
+        ".filter(function(el){return isVisible(el)&&isEnabled(el)&&isLeaf(el,sel);});}"
+        "var cands=gather(primarySel);"
+        "if(cands.length===0)cands=gather(fallbackSel);"
+        "if(cands.length===0){"
+        "if(doType){"
+        "var scopeRoot=trigger.closest('[role=\"combobox\"]')||trigger.parentElement||trigger;"
+        "var seen=new Set();"
+        "var inputs=Array.from(scopeRoot.querySelectorAll('input[type=\"text\"],input:not([type])'))"
+        ".concat(Array.from(container.querySelectorAll('input[type=\"text\"],input:not([type])')))"
+        ".filter(function(el){if(seen.has(el))return false;seen.add(el);return true;})"
+        ".filter(function(el){return isVisible(el)&&!el.hasAttribute('data-atlas-typed');});"
+        "if(inputs.length===1){"
+        "var inp=inputs[0];inp.setAttribute('data-atlas-typed','1');"
+        "var setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
+        "setter.call(inp,wanted);"
+        "inp.dispatchEvent(new Event('input',{bubbles:true}));"
+        "return JSON.stringify({status:'pending',reason:'typed-filter',"
+        "containerSource:containerSource});}}"
+        "if(doScroll&&container.scrollHeight>container.clientHeight){"
+        "container.scrollTop=Math.min(container.scrollTop+container.clientHeight,"
+        "container.scrollHeight);"
+        "return JSON.stringify({status:'pending',reason:'scrolled',"
+        "containerSource:containerSource});}"
+        "return JSON.stringify({status:'pending',reason:'rendering',"
+        "containerSource:containerSource});}"
+        "var exact=cands.filter(function(o){return normalize(o.textContent)===wl;});"
+        "var chosen=null,matchCount=0;"
+        "if(exact.length>1){"
+        "return JSON.stringify({status:'ambiguous',reason:'multiple-exact-matches',"
+        "matchCount:exact.length,containerSource:containerSource,"
+        "candidates:exact.map(function(o){return normalize(o.textContent).slice(0,60);})});}"
+        "if(exact.length===1){chosen=exact[0];matchCount=1;}"
+        "if(!chosen){var starts=cands.filter(function(o){"
+        "return normalize(o.textContent).indexOf(wl)===0;});"
+        "if(starts.length>0){chosen=starts[0];matchCount=starts.length;}}"
+        "if(!chosen){var sub=cands.filter(function(o){"
+        "return normalize(o.textContent).indexOf(wl)!==-1;});"
+        "if(sub.length>0){chosen=sub[0];matchCount=sub.length;}}"
+        "if(!chosen){"
+        "return JSON.stringify({status:'pending',reason:'no-match-yet',"
+        "containerSource:containerSource,"
+        "optionsSeen:cands.slice(0,20).map(function(o){"
+        "return normalize(o.textContent).slice(0,40);})});}"
+        "document.querySelectorAll('[data-atlas-picked]').forEach(function(e){"
+        "e.removeAttribute('data-atlas-picked');});"
+        "chosen.setAttribute('data-atlas-picked','1');"
+        # COMMIT CHANGE (Bug #2 fix): this used to dispatch its OWN
+        # pointerdown/mousedown/click sequence on the leaf here -- react-
+        # select and styled-component cards ignore that (confirmed live,
+        # isTrusted-gated). Instead just report the leaf's rect; the python
+        # caller commits with a REAL cliclick via real_click_verified() and
+        # re-runs _combobox_verify_js() below to confirm it landed.
+        "var r=chosen.getBoundingClientRect();"
+        "return JSON.stringify({status:'picked',containerSource:containerSource,"
+        "selectedText:normalize(chosen.textContent).slice(0,80),matchCount:matchCount,"
+        "tag:chosen.tagName,rect:{vx:r.x,vy:r.y,vw:r.width,vh:r.height}});"
+        "})()"
+    ) % (json.dumps(value), "true" if do_scroll else "false", "true" if do_type else "false")
+
+
+def _combobox_verify_js(value):
+    """Step 3: re-read after a tick. `ok` requires >=1 STRONG signal:
+      - trigger's displayed text now normalized-contains `value` (strongest
+        -- this is what a human actually sees change).
+      - the data-atlas-picked leaf now has aria-selected/aria-checked=true.
+      - a linked form field (nearest hidden input/select in the trigger's
+        combobox-root scope, snapshotted pre-open) changed value.
+    aria-expanded flipping true->false with NONE of the above is reported
+    as unverified/menu-closed-only -- a closed menu proves nothing by
+    itself; several widgets close on any outside click, matched or not.
+    Removes the trigger marker either way; this is the final exit point on
+    the combobox path."""
+    return (
+        "(function(){"
+        "function normalize(t){return (t||'').replace(/\\s+/g,' ').trim().toLowerCase();}"
+        "var wl=normalize(%s);"
+        "var trigger=document.querySelector('[data-atlas-select-target]');"
+        "if(!trigger)return JSON.stringify({status:'error',reason:'trigger-lost-after-click',"
+        "detail:'trigger element lost between clicking the option and verifying it'});"
+        "var triggerText=normalize(trigger.tagName==='INPUT'?trigger.value:trigger.textContent);"
+        "var verifiedBy=null;"
+        "if(triggerText.indexOf(wl)!==-1)verifiedBy='text';"
+        "var picked=document.querySelector('[data-atlas-picked]');"
+        "if(!verifiedBy&&picked){"
+        "if(picked.getAttribute('aria-selected')==='true'||"
+        "picked.getAttribute('aria-checked')==='true')verifiedBy='aria-selected';}"
+        "if(!verifiedBy){"
+        "var prev=trigger.getAttribute('data-atlas-prefieldval');"
+        "if(prev!==null){"
+        "var fieldScope=trigger.closest('[role=\"combobox\"]')||trigger.parentElement||trigger;"
+        "var field=fieldScope.querySelector('input[type=\"hidden\"],select')||"
+        "((trigger.tagName==='INPUT'||trigger.tagName==='SELECT')?trigger:null);"
+        "if(field&&field.value!==prev)verifiedBy='form-field';}}"
+        "var preExpanded=trigger.getAttribute('data-atlas-preexpanded');"
+        "var nowExpanded=trigger.getAttribute('aria-expanded');"
+        "var menuClosedOnly=(!verifiedBy&&preExpanded==='true'&&nowExpanded==='false');"
+        # Fix #2 (Asclepius QA, 100% reproducible): only strip the marker on
+        # a VERIFIED success. Stripping it unconditionally (on unverified
+        # results too, as this used to) meant a retry's re-open call
+        # (_combobox_open_js) could never find `[data-atlas-select-target]`
+        # again -- every retry past attempt 1 died with 'target-lost',
+        # silently making `--retries N` dead beyond the first attempt.
+        # On an unverified result the marker is left in place so
+        # _set_select_combobox's retry loop can re-open the SAME target;
+        # it still gets cleaned up eventually via set_select()'s
+        # unconditional _cleanup_markers_js() call on every exit path.
+        "if(verifiedBy){trigger.removeAttribute('data-atlas-select-target');"
+        "return JSON.stringify({status:'ok',verifiedBy:verifiedBy,"
+        "triggerText:triggerText.slice(0,80)});}"
+        "return JSON.stringify({status:'unverified',"
+        "reason:menuClosedOnly?'menu-closed-only':'no-transition-detected',"
+        "triggerText:triggerText.slice(0,80)});"
+        "})()"
+    ) % json.dumps(value)
+
+
+def _combobox_open_and_poll_for_pick(browser, value, poll_interval, poll_ceiling):
+    """
+    One full open-then-poll pass: opens the combobox, then polls
+    _combobox_scan_js until it reports a committed match (`status:'picked'`,
+    the leaf's rect, ready for a real click) or a terminal non-retryable
+    outcome (ambiguous / no-match / menu-did-not-open / error). Does NOT
+    click or verify -- that's the caller's job (_set_select_combobox), so a
+    failed real-click can re-invoke this to re-open the menu without
+    duplicating the poll logic.
+    """
+    ok, out, err = _arc_execute_js(_combobox_open_js(), browser)
+    if not ok or not out:
+        return {"status": "error", "reason": "execute-js-failed",
+                "detail": "opening combobox: " + (err or "empty result")}
+    try:
+        open_result = _parse_js_json(out)
+    except ValueError as e:
+        return {"status": "error", "reason": "json-parse-failed",
+                "detail": "combobox-open: %s (raw: %s)" % (e, out[:300])}
+    if open_result.get("status") == "error":
+        return open_result
+
+    deadline = time.time() + poll_ceiling
+    sub_deadline = time.time() + poll_ceiling * 0.5
+    prev_options_seen = None
+    prev_container_candidates = None
+    saw_any_candidates = False
+    typed_attempted = False
+    last_result = None
+
+    while time.time() < deadline:
+        do_scroll = time.time() > sub_deadline
+        do_type_now = not typed_attempted
+        ok2, out2, err2 = _arc_execute_js(_combobox_scan_js(value, do_scroll, do_type_now), browser)
+        if not ok2 or not out2:
+            return {"status": "error", "reason": "execute-js-failed",
+                    "detail": "scanning combobox: " + (err2 or "empty result")}
+        try:
+            result = _parse_js_json(out2)
+        except ValueError as e:
+            return {"status": "error", "reason": "json-parse-failed",
+                    "detail": "combobox-scan: %s (raw: %s)" % (e, out2[:300])}
+        last_result = result
+        status = result.get("status")
+        if status in ("error", "ambiguous"):
+            return result
+        if status == "picked":
+            return result
+
+        reason = result.get("reason")
+        if reason == "typed-filter":
+            typed_attempted = True
+        elif reason == "no-match-yet":
+            saw_any_candidates = True
+            options_seen = result.get("optionsSeen", [])
+            if prev_options_seen is not None and options_seen == prev_options_seen:
+                return {"status": "no-match", "optionsSeen": options_seen,
+                        "containerSource": result.get("containerSource")}
+            prev_options_seen = options_seen
+        elif reason == "container-unresolved":
+            # The trigger's own popup may simply not have mounted yet right
+            # after the open click -- only refuse once this is STABLE across
+            # consecutive polls, same discipline as no-match-yet, so the
+            # early ticks of a normal render race don't get misreported as
+            # an unresolvable ambiguity.
+            candidates = result.get("candidates", [])
+            if prev_container_candidates is not None and candidates == prev_container_candidates:
+                return {"status": "ambiguous", "reason": "container-unresolved",
+                        "candidates": candidates}
+            prev_container_candidates = candidates
+        time.sleep(poll_interval)
+
+    if last_result and last_result.get("reason") == "container-unresolved":
+        return {"status": "ambiguous", "reason": "container-unresolved",
+                "candidates": last_result.get("candidates", [])}
+    if not saw_any_candidates:
+        return {"status": "menu-did-not-open",
+                "detail": "no candidates rendered within the poll ceiling"}
+    if last_result and last_result.get("reason") == "no-match-yet":
+        return {"status": "no-match", "optionsSeen": last_result.get("optionsSeen", []),
+                "containerSource": last_result.get("containerSource")}
+    return {"status": "menu-did-not-open",
+            "detail": "timed out waiting for options to stabilize"}
+
+
+def _set_select_combobox(browser, value, retries=3, poll_interval=0.15, poll_ceiling=2.0):
+    """
+    Open + poll (JS) to locate and mark the matching option, then COMMIT
+    with a REAL cliclick at the option's own rect via real_click_verified()
+    (Bug #2 fix -- react-select/styled-component options ignore a
+    dispatched click, they only respond to a genuine OS-level one).
+    Re-verifies with _combobox_verify_js() same as before. On an unverified
+    real-click, re-opens the menu and retries the whole open+poll+click
+    cycle up to `retries` times -- a single miscommit shouldn't be fatal if
+    the widget is still in a clickable state after re-opening.
+    """
+    last_failure = None
+    for attempt in range(1, retries + 1):
+        picked = _combobox_open_and_poll_for_pick(browser, value, poll_interval, poll_ceiling)
+        status = picked.get("status")
+        if status != "picked":
+            # ambiguous / no-match / menu-did-not-open / error are semantic
+            # failures, not "the click didn't land" -- retrying a real click
+            # won't fix a widget that never rendered the option at all, so
+            # these return immediately rather than burning retries.
+            return picked
+
+        def _verify():
+            time.sleep(0.12)  # let the widget's own click handler update text/aria state
+            ok3, out3, err3 = _arc_execute_js(_combobox_verify_js(value), browser)
+            if not ok3 or not out3:
+                return False, None, "verifying combobox selection: " + (err3 or "empty result")
+            try:
+                v = _parse_js_json(out3)
+            except ValueError as e:
+                return False, None, "combobox-verify: %s (raw: %s)" % (e, out3[:300])
+            if v.get("status") == "ok":
+                return True, v.get("verifiedBy"), v
+            return False, None, v
+
+        click_result = real_click_verified(browser, picked["rect"], _verify)
+        if click_result["ok"]:
+            verify_detail = click_result["detail"] if isinstance(click_result["detail"], dict) else {}
+            result = dict(verify_detail)
+            result["status"] = "ok"
+            result["mode"] = "combobox"
+            result["method"] = "js->real-click"
+            result["attempts"] = attempt
+            result["containerSource"] = picked.get("containerSource")
+            result["selectedText"] = picked.get("selectedText")
+            result["coords"] = click_result["coords"]
+            return result
+
+        last_failure = click_result
+        run_jxa_key("escape", {})  # close whatever's left open before re-opening
+
+    return {"status": "unverified", "reason": "real-click-did-not-verify-after-retries",
+            "attempts": retries, "detail": last_failure.get("detail") if last_failure else None,
+            "mode": "combobox"}
+
+
+def _parse_js_json(out):
+    """Same double-decode every JS-returning helper here needs: AppleScript
+    prints a JSON string as a quoted, escaped literal, which is itself valid
+    JSON for a string."""
+    parsed = json.loads(json.loads(out) if out.startswith('"') else out)
+    if parsed is None:
+        # Arc returns the literal `null` when the injected JS threw (most often
+        # an invalid CSS selector). Surface that as a parse error the callers
+        # already handle, instead of handing back None for them to `.get()`.
+        raise ValueError("JS returned null (the injected script most likely threw)")
+    return parsed
+
+
+def set_select(browser, selector, name, index, value, retries=3):
+    if not _is_app_running(browser):
+        return {"status": "error", "reason": "app-not-running",
+                "detail": "%s is not running -- set-select will not auto-launch a browser, "
+                          "open it first" % browser}
+
+    ok, out, err = _arc_execute_js(_resolve_select_target_js(selector, name, index), browser)
+    if not ok or not out:
+        return {"status": "error", "reason": "execute-js-failed",
+                "detail": "resolving target: " + (err or "empty result")}
+    try:
+        resolved = _parse_js_json(out)
+    except ValueError as e:
+        return {"status": "error", "reason": "json-parse-failed",
+                "detail": "resolve-target: %s (raw: %s)" % (e, out[:300])}
+    if resolved.get("status") == "error":
+        return resolved
+
+    if resolved.get("tag") == "SELECT":
+        result = _set_select_native(browser, value)
+    else:
+        result = _set_select_combobox(browser, value, retries=retries)
+
+    # Marker hygiene (invariant 5): clear every marker on every exit, success
+    # or not. Best-effort -- a failed cleanup call doesn't change the result
+    # the caller already has, it just means a marker may linger until the
+    # next set-select's stale-sweep clears it.
+    _arc_execute_js(_cleanup_markers_js(), browser)
+
+    if result.get("status") != "ok":
+        run_jxa_key("escape", {})  # don't leave a partially-open menu hanging
+    return result
+
+
+def cmd_set_select(args):
+    # Deprecated alias (kept for one release, per the rebuild spec) --
+    # identical behavior to `select`, just the old verb name and no
+    # --retries flag of its own (uses the default).
+    out = set_select(args.app, args.selector, args.name, args.index, args.value)
+    out["deprecated"] = "set-select is deprecated, use `select` instead"
+    print(json.dumps(out))
+    if out.get("status") != "ok":
+        sys.exit(1)
+
+
+def cmd_select(args):
+    out = set_select(args.app, args.selector, args.name, args.index, args.value, args.retries)
+    print(json.dumps(out))
+    if out.get("status") != "ok":
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# uniform command envelope (section 1 of the rebuild spec). `fill` and the
+# web mode of `click` return exactly this shape. `ok` is true ONLY when
+# `verified` is true -- no command reports success off an unread-back
+# dispatch.
+# ---------------------------------------------------------------------------
+
+def make_envelope(ok, action, verified, verifiedBy=None, method=None, attempts=1,
+                   target=None, value=None, coords=None, escalation=None,
+                   reason=None, detail=None):
+    env = {
+        "ok": bool(ok) and bool(verified),
+        "action": action,
+        "verified": bool(verified),
+        "verifiedBy": verifiedBy if verified else None,
+        "method": method,
+        "attempts": attempts,
+        "target": target,
+        "value": value,
+        "coords": coords,
+        "escalation": escalation,
+    }
+    if not env["ok"]:
+        env["reason"] = reason
+    if detail is not None:
+        env["detail"] = detail
+    return env
+
+
+# ---------------------------------------------------------------------------
+# fill: React-safe native setter + input/change/blur, the JS-bridge-first
+# replacement for `type` on web content (Bug #1 -- synthetic keystrokes
+# never reached a single Arc web input, the native setter + dispatched
+# events did, 100% of the time). Reuses _resolve_select_target_js verbatim
+# (it's not select-specific, it just marks whichever element matched).
+# ---------------------------------------------------------------------------
+
+_FILL_HELPERS_JS = (
+    "function normalize(t){return (t||'').replace(/\\s+/g,' ').trim();}"
+    "function findErrorNode(el){"
+    "function byId(id){return id?document.getElementById(id):null;}"
+    "var described=(el.getAttribute('aria-describedby')||'').split(/\\s+/).filter(Boolean);"
+    "for(var i=0;i<described.length;i++){var n=byId(described[i]);if(n)return n;}"
+    "var em=byId(el.getAttribute('aria-errormessage'));if(em)return em;"
+    "var scope=el.parentElement||el;"
+    "var sib=scope.querySelector('[aria-invalid=\"true\"]');"
+    "if(sib&&sib!==el){var sibErr=sib.parentElement&&sib.parentElement.querySelector("
+    "'.ant-form-item-explain,[role=\"alert\"],[class*=\"error\"]');if(sibErr)return sibErr;}"
+    "var container=el.closest('.ant-form-item')||el.closest('[class*=\"form-item\"]')||scope;"
+    "var explain=container.querySelector('.ant-form-item-explain');if(explain)return explain;"
+    "var alertNode=container.querySelector('[role=\"alert\"]');if(alertNode)return alertNode;"
+    "var errClass=container.querySelector('[class*=\"error\"]');if(errClass)return errClass;"
+    "return null;}"
+    # React's controlled-component valueTracker silently swallows a bare
+    # `el.value=`, same reason _native_select_match_and_set_js goes through
+    # the native property setter instead -- picked per tag so a <textarea>
+    # or (rare, via fill) a <select> get their own prototype's setter.
+    "function nativeSetterFor(el){"
+    "var proto=HTMLInputElement.prototype;"
+    "if(el instanceof HTMLTextAreaElement)proto=HTMLTextAreaElement.prototype;"
+    "else if(el instanceof HTMLSelectElement)proto=HTMLSelectElement.prototype;"
+    "return Object.getOwnPropertyDescriptor(proto,'value').set;}"
+)
+
+
+def _fill_set_js(value):
+    """Phase 1: set the value on the marked target via the React-safe
+    native setter, dispatch input then change then blur, and snapshot the
+    validation-error node's text BEFORE the set (so the caller can diff
+    against the after-set read and tell "error changed" from "error was
+    already there"). Does not read back the value itself -- that's
+    _fill_read_js()'s job, run after a short settle so a controlled
+    component's re-render has happened."""
+    return (
+        "(function(){"
+        + _FILL_HELPERS_JS +
+        "var el=document.querySelector('[data-atlas-select-target]');"
+        "if(!el)return JSON.stringify({status:'error',reason:'target-lost',"
+        "detail:'target element lost (page may have re-rendered)'});"
+        "var errBeforeNode=findErrorNode(el);"
+        "var errBefore=errBeforeNode?normalize(errBeforeNode.textContent):'';"
+        "var setter=nativeSetterFor(el);"
+        "setter.call(el,%s);"
+        "el.dispatchEvent(new Event('input',{bubbles:true}));"
+        "el.dispatchEvent(new Event('change',{bubbles:true}));"
+        "el.blur();"
+        "var r=el.getBoundingClientRect();"
+        "return JSON.stringify({status:'set',tag:el.tagName,errorTextBefore:errBefore,"
+        "rect:{vx:r.x,vy:r.y,vw:r.width,vh:r.height}});"
+        "})()"
+    ) % json.dumps(value)
+
+
+def _fill_read_js():
+    """Re-read after the settle. Does NOT remove the marker (fill() clears
+    it via the shared _cleanup_markers_js() on every exit path, same
+    discipline as set_select()) -- a possible hand-to-human escalation
+    still needs to find the same element by marker afterward."""
+    return (
+        "(function(){"
+        + _FILL_HELPERS_JS +
+        "var el=document.querySelector('[data-atlas-select-target]');"
+        "if(!el)return JSON.stringify({status:'error',reason:'target-lost-after-set',"
+        "detail:'target element lost between setting the value and reading it back'});"
+        "var errNode=findErrorNode(el);"
+        "var errText=errNode?normalize(errNode.textContent):'';"
+        "var r=el.getBoundingClientRect();"
+        "return JSON.stringify({status:'read',value:el.value,errorText:errText,tag:el.tagName,"
+        "rect:{vx:r.x,vy:r.y,vw:r.width,vh:r.height}});"
+        "})()"
+    )
+
+
+def _fill_check_focused_js():
+    """Used only by the hand-to-human real-key attempt's real_click_verified
+    call, to confirm the real click actually focused the marked field
+    before typing at it."""
+    return (
+        "(function(){"
+        "var el=document.querySelector('[data-atlas-select-target]');"
+        "return JSON.stringify({focused: !!(el&&document.activeElement===el)});"
+        "})()"
+    )
+
+
+def _escalate_fill_to_human(browser, value, label, current_value, validation_error,
+                             validation_error_before, rect, await_human_secs):
+    """
+    Section 5. Terminal, documented, non-looping. Called only when the
+    native setter's value demonstrably reached the form (readback matched
+    `value`) but a validation error persists (the Ant `data-is-phone`
+    signature: required -> invalid format, never clearing). Sequence, each
+    step read-back-verified, stops at first success:
+      1. (already done by the caller before this is invoked: native setter
+         + input/change/blur.)
+      2. ONE real-key attempt: real_click_verified() to focus the field for
+         real, then a real cliclick keystroke sequence + Enter. Expected to
+         fail on genuinely fiber-gated Arc web content (see spec's open
+         items) -- succeeding is a bonus, not a contract change.
+      3. Still non-empty error -> emit the escalation ONCE. No retry loop.
+    Optional await_human_secs: after emitting, poll the field until the
+    error clears or the timeout is hit, rather than a hard non-blocking
+    return.
+
+    validation_error_before (Fix #3): the error text read BEFORE the native
+    setter ran (_fill_set_js's errorTextBefore), needed to prove the
+    escalation is a real "error changed required->invalid" case and not
+    "error was already there, the fill did nothing". _fill_set_js computed
+    this all along but fill() never read it back until this fix -- the
+    escalation payload only ever surfaced the AFTER error.
+    """
+    def _verify_focus():
+        ok, out, err = _arc_execute_js(_fill_check_focused_js(), browser)
+        if not ok or not out:
+            return False, None, "execute-js-failed checking focus: " + (err or "empty result")
+        try:
+            r = _parse_js_json(out)
+        except ValueError as e:
+            return False, None, "json-parse-failed: %s" % e
+        return bool(r.get("focused")), ("focused" if r.get("focused") else None), r
+
+    real_key_attempted = False
+    if rect:
+        focus_result = real_click_verified(browser, rect, _verify_focus)
+        if focus_result["ok"]:
+            real_key_attempted = True
+            # Clear whatever the native setter already put there first --
+            # a real cliclick keystroke sequence TYPES INTO the field on
+            # top of existing content, it doesn't replace it (confirmed
+            # live: without this, the field ended up with the value
+            # doubled/appended).
+            run_jxa_key("a", {"cmd": True})
+            run_jxa_key("delete", {})
+            cliclick("t:%s" % value)
+            run_jxa_key("return", {})
+            time.sleep(0.15)
+
+    error_after = validation_error
+    current_after = current_value
+    ok2, out2, err2 = _arc_execute_js(_fill_read_js(), browser)
+    if ok2 and out2:
+        try:
+            r2 = _parse_js_json(out2)
+            if r2.get("status") == "read":
+                error_after = r2.get("errorText", "")
+                current_after = r2.get("value", current_value)
+        except ValueError:
+            pass
+
+    if not error_after:
+        return {"ok": True, "verified": True, "verifiedBy": "error-cleared",
+                "method": "js->real-key" if real_key_attempted else "js",
+                "currentValue": current_after}
+
+    escalation = {
+        "ok": False, "verified": False, "verifiedBy": None,
+        "method": "js->real-click" if real_key_attempted else "js",
+        "currentValue": current_after,
+        # Fix #3: surface BOTH error strings -- validationErrorBefore (read
+        # before the native setter ran) proves this is a real "required ->
+        # invalid" transition, not "the error was already there and fill
+        # did nothing"; validationError is the AFTER state a human still
+        # needs to clear.
+        "field": {"label": label, "currentValue": current_after,
+                  "validationError": error_after,
+                  "validationErrorBefore": validation_error_before},
+        "detail": "Type %r into %s manually, then continue." % (value, label or "the field"),
+    }
+
+    if await_human_secs:
+        deadline = time.time() + await_human_secs
+        while time.time() < deadline:
+            time.sleep(1.0)
+            ok3, out3, _err3 = _arc_execute_js(_fill_read_js(), browser)
+            if ok3 and out3:
+                try:
+                    r3 = _parse_js_json(out3)
+                except ValueError:
+                    r3 = None
+                if r3 and r3.get("status") == "read" and not r3.get("errorText"):
+                    escalation["ok"] = True
+                    escalation["verified"] = True
+                    escalation["verifiedBy"] = "error-cleared"
+                    escalation["currentValue"] = r3.get("value")
+                    escalation["awaitedHuman"] = True
+                    return escalation
+        escalation["awaitedHuman"] = True
+        escalation["awaitTimedOut"] = True
+    return escalation
+
+
+def fill(browser, selector, name, index, value, press_enter=False, verify=True, await_human_secs=None):
+    if not _is_app_running(browser):
+        return make_envelope(False, "fill", False, reason="app-not-running",
+                              detail="%s is not running, fill will not auto-launch a browser, "
+                                     "open it first" % browser)
+
+    ok, out, err = _arc_execute_js(_resolve_select_target_js(selector, name, index), browser)
+    if not ok or not out:
+        return make_envelope(False, "fill", False, reason="execute-js-failed",
+                              detail="resolving target: " + (err or "empty result"))
+    try:
+        resolved = _parse_js_json(out)
+    except ValueError as e:
+        return make_envelope(False, "fill", False, reason="json-parse-failed",
+                              detail="resolve-target: %s (raw: %s)" % (e, out[:300]))
+    if resolved.get("status") == "error":
+        return make_envelope(False, "fill", False, reason=resolved.get("reason", "resolve-failed"),
+                              detail=resolved.get("detail"))
+
+    label = resolved.get("text") or name
+
+    ok2, out2, err2 = _arc_execute_js(_fill_set_js(value), browser)
+    if not ok2 or not out2:
+        _arc_execute_js(_cleanup_markers_js(), browser)
+        return make_envelope(False, "fill", False, reason="execute-js-failed",
+                              detail="setting value: " + (err2 or "empty result"))
+    try:
+        set_result = _parse_js_json(out2)
+    except ValueError as e:
+        _arc_execute_js(_cleanup_markers_js(), browser)
+        return make_envelope(False, "fill", False, reason="json-parse-failed",
+                              detail="fill-set: %s (raw: %s)" % (e, out2[:300]))
+    if set_result.get("status") == "error":
+        _arc_execute_js(_cleanup_markers_js(), browser)
+        return make_envelope(False, "fill", False, reason=set_result.get("reason", "set-failed"),
+                              detail=set_result.get("detail"),
+                              target={"tag": None, "selector": selector, "label": label})
+
+    tag = set_result.get("tag")
+    rect = set_result.get("rect")
+    target = {"tag": tag, "selector": selector, "label": label, "rect": rect}
+    # Fix #3: _fill_set_js already computes this (the error text BEFORE the
+    # native setter ran), but it used to be dropped on the floor here -- the
+    # hand-to-human escalation only ever surfaced the AFTER error.
+    error_text_before = set_result.get("errorTextBefore") or ""
+
+    if not verify:
+        # Section 4's `ok == verified` invariant holds even here -- skipping
+        # verification means the caller does not get to claim `ok`, it just
+        # gets the dispatch done faster. This is the honest tradeoff of
+        # --no-verify, not a way to force a false success.
+        _arc_execute_js(_cleanup_markers_js(), browser)
+        return make_envelope(False, "fill", False, method="js", target=target,
+                              value={"wanted": value}, reason="verification-skipped",
+                              detail="--no-verify requested: value dispatched but not read back, "
+                                     "ok cannot be asserted")
+
+    time.sleep(0.08)
+    ok3, out3, err3 = _arc_execute_js(_fill_read_js(), browser)
+    if not ok3 or not out3:
+        _arc_execute_js(_cleanup_markers_js(), browser)
+        return make_envelope(False, "fill", False, reason="execute-js-failed",
+                              detail="reading back value: " + (err3 or "empty result"), target=target)
+    try:
+        read_result = _parse_js_json(out3)
+    except ValueError as e:
+        _arc_execute_js(_cleanup_markers_js(), browser)
+        return make_envelope(False, "fill", False, reason="json-parse-failed",
+                              detail="fill-read: %s (raw: %s)" % (e, out3[:300]), target=target)
+    if read_result.get("status") == "error":
+        _arc_execute_js(_cleanup_markers_js(), browser)
+        return make_envelope(False, "fill", False, reason=read_result.get("reason", "read-failed"),
+                              detail=read_result.get("detail"), target=target)
+
+    readback = read_result.get("value")
+    error_text = read_result.get("errorText") or ""
+    rect = read_result.get("rect") or rect
+    target["rect"] = rect
+    value_info = {"wanted": value, "readback": readback, "validationError": error_text}
+    value_matches = (readback == value) or (isinstance(readback, str) and readback.strip() == value.strip())
+
+    if value_matches and not error_text:
+        _arc_execute_js(_cleanup_markers_js(), browser)
+        env = make_envelope(True, "fill", True, verifiedBy="value-readback", method="js",
+                             target=target, value=value_info)
+        if press_enter:
+            env["enterResult"] = run_jxa_key("return", {})
+        return env
+
+    if value_matches and error_text:
+        # Value demonstrably reached the form, but the validator won't
+        # clear -- section 5's hand-to-human case, not a plain failure.
+        esc = _escalate_fill_to_human(browser, value, label, readback, error_text,
+                                       error_text_before, rect, await_human_secs)
+        _arc_execute_js(_cleanup_markers_js(), browser)
+        final_value = {"wanted": value, "readback": esc.get("currentValue", readback),
+                        "validationError": "" if esc.get("ok") else error_text}
+        env = make_envelope(esc.get("ok", False), "fill", esc.get("verified", False),
+                             verifiedBy=esc.get("verifiedBy"), method=esc.get("method", "js"),
+                             target=target, value=final_value,
+                             escalation=None if esc.get("ok") else "hand-to-human",
+                             reason=None if esc.get("ok") else "validated-input-rejects-synthetic",
+                             detail=esc.get("detail"))
+        if not esc.get("ok") and esc.get("field"):
+            env["field"] = esc["field"]
+        if esc.get("awaitedHuman"):
+            env["awaitedHuman"] = True
+        return env
+
+    # readback didn't match the wanted value at all -- a plain failure, not
+    # an escalation case (escalation is specifically for "value arrived but
+    # validator rejects it", not "value never arrived").
+    _arc_execute_js(_cleanup_markers_js(), browser)
+    return make_envelope(False, "fill", False, reason="value-did-not-stick",
+                          detail="native setter dispatched but readback %r != wanted %r"
+                                 % (readback, value),
+                          target=target, value=value_info)
+
+
+def cmd_fill(args):
+    out = fill(args.app, args.selector, args.name, args.index, args.value,
+               press_enter=args.enter, verify=not args.no_verify,
+               await_human_secs=args.await_human)
+    print(json.dumps(out))
+    if not out.get("ok"):
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# click / type / key / scroll
+# ---------------------------------------------------------------------------
+
+_click_window_bounds = None
+
+
+def click_xy(x, y, double=False, right=False, from_view=None):
+    if from_view:
+        sw = screen_width_points()
+        x = int(round(x * sw / from_view))
+        y = int(round(y * sw / from_view))
+    cmd = "dc" if double else ("rc" if right else "c")
+    out = cliclick("%s:%d,%d" % (cmd, x, y))
+    out["x"] = x
+    out["y"] = y
+    # Off-window guard. `dom` reports viewport-relative rects, so an element
+    # scrolled below the fold has a y larger than the window height and the
+    # derived screen point lands past the window edge, on the desktop or on
+    # whatever is behind. cliclick happily clicks there and reports ok, which
+    # reads as "the control did not respond" and sends you debugging the page
+    # instead of the coordinate. Cost real debugging time on a real web
+    # form. Scroll the element in first (scrollIntoView) and
+    # re-read its rect.
+    if _click_window_bounds:
+        wx, wy, ww, wh = _click_window_bounds
+        if not (wx <= x <= wx + ww and wy <= y <= wy + wh):
+            out["outsideWindow"] = True
+            out["windowBounds"] = {"x": wx, "y": wy, "w": ww, "h": wh}
+            out["warning"] = ("click point (%d,%d) is OUTSIDE the target window -- "
+                              "the element is most likely scrolled out of view; "
+                              "scrollIntoView it and re-read its rect" % (x, y))
+    return out
+
+
+def _frontmost_window_bounds():
+    """Largest window of the frontmost app, as (x, y, w, h). Best-effort: any
+    failure returns None and the off-window guard simply stays quiet."""
+    global _click_window_bounds
+    try:
+        win = run_jxa_ax("windows", {})
+        if "error" in win or not win.get("windows"):
+            return None
+        w = sorted(win["windows"], key=lambda d: (d.get("w") or 0) * (d.get("h") or 0),
+                   reverse=True)[0]
+        return (w.get("x", 0), w.get("y", 0), w.get("w", 0), w.get("h", 0))
+    except Exception:
+        return None
+
+
+def cmd_click_xy(args):
+    global _click_window_bounds
+    _click_window_bounds = _frontmost_window_bounds()
+    out = click_xy(args.x, args.y, args.double, args.right, args.from_view)
+    print(json.dumps(out))
+    if "error" in out:
+        sys.exit(1)
+
+
+def find_one(role, name, index, app, window_index=0, limit=50):
+    found = run_jxa_ax("find", {"app": app, "role": role, "name": name,
+                                 "limit": limit, "windowIndex": window_index})
+    if "error" in found:
+        return None, found
+    matches = found.get("matches", [])
+    if index >= len(matches):
+        return None, {"error": "no match at index %d (found %d matches for role=%s name=%s)"
+                                % (index, len(matches), role, name)}
+    return matches[index], None
+
+
+def ax_press(role, name, index, app):
+    """
+    Perform the element's own default AX action (AXPress, via System
+    Events' `click` command on the UI element reference) instead of moving
+    the mouse to a computed point. Preferred over a coordinate click:
+    doesn't misfire if the element is scrolled, partially occluded, or the
+    window has moved since `find` last reported its position. Not every
+    element supports a default action (custom canvas-drawn controls,
+    disabled elements), that's an expected failure, the caller should fall
+    back to coordinate-click when this returns an error.
+    """
+    return run_jxa_ax("press", {"app": app, "role": role, "name": name, "index": index})
+
+
+# ---------------------------------------------------------------------------
+# click --selector: web mode (Bug #5's other half). Native AX-press (above)
+# stays exactly as it was for native apps -- this is ONLY for web content,
+# where a card/button may have no reliable AX role at all.
+# ---------------------------------------------------------------------------
+
+def _click_web_signature_js():
+    """Snapshot the marked target's own state signature plus two page-wide
+    signals (location.href, document.body.childElementCount) that catch a
+    click that navigated or mounted/unmounted content rather than toggling
+    the element's own attributes. Also returns the element's rect so a
+    real-click escalation, if needed, doesn't have to re-resolve it."""
+    return (
+        "(function(){"
+        "var el=document.querySelector('[data-atlas-select-target]');"
+        "if(!el)return JSON.stringify({status:'error',reason:'target-lost',"
+        "detail:'target element lost (page may have re-rendered)'});"
+        "var r=el.getBoundingClientRect();"
+        "return JSON.stringify({status:'read',signature:{"
+        "ariaPressed:el.getAttribute('aria-pressed'),"
+        "ariaSelected:el.getAttribute('aria-selected'),"
+        "className:el.className,"
+        "href:location.href,"
+        "bodyCount:document.body.childElementCount},"
+        "rect:{vx:r.x,vy:r.y,vw:r.width,vh:r.height}});"
+        "})()"
+    )
+
+
+def _click_web_dispatch_js():
+    """Full pointer/mouse/click sequence on the marked target -- the same
+    dispatched-event style _combobox_open_js's trigger uses (works for
+    handlers that don't require event.isTrusted; the elements that DO
+    require it are exactly what the signature-unchanged path below
+    escalates to a real click for)."""
+    return (
+        "(function(){"
+        "var el=document.querySelector('[data-atlas-select-target]');"
+        "if(!el)return JSON.stringify({status:'error',reason:'target-lost',"
+        "detail:'target element lost (page may have re-rendered)'});"
+        "var opts={bubbles:true,cancelable:true,view:window};"
+        "try{el.dispatchEvent(new PointerEvent('pointerdown',opts));}catch(e){}"
+        "el.dispatchEvent(new MouseEvent('mousedown',opts));"
+        "try{el.dispatchEvent(new PointerEvent('pointerup',opts));}catch(e){}"
+        "el.dispatchEvent(new MouseEvent('mouseup',opts));"
+        "el.dispatchEvent(new MouseEvent('click',opts));"
+        "return JSON.stringify({status:'dispatched'});"
+        "})()"
+    )
+
+
+def click_web(browser, selector, name, index):
+    if not _is_app_running(browser):
+        return make_envelope(False, "click", False, reason="app-not-running",
+                              detail="%s is not running, click will not auto-launch a browser, "
+                                     "open it first" % browser)
+
+    ok, out, err = _arc_execute_js(_resolve_select_target_js(selector, name, index), browser)
+    if not ok or not out:
+        return make_envelope(False, "click", False, reason="execute-js-failed",
+                              detail="resolving target: " + (err or "empty result"))
+    try:
+        resolved = _parse_js_json(out)
+    except ValueError as e:
+        return make_envelope(False, "click", False, reason="json-parse-failed",
+                              detail="resolve-target: %s (raw: %s)" % (e, out[:300]))
+    if resolved.get("status") == "error":
+        return make_envelope(False, "click", False, reason=resolved.get("reason", "resolve-failed"),
+                              detail=resolved.get("detail"))
+    label = resolved.get("text") or name
+    target = {"tag": resolved.get("tag"), "selector": selector, "label": label, "rect": None}
+
+    def _read_signature():
+        ok_s, out_s, err_s = _arc_execute_js(_click_web_signature_js(), browser)
+        if not ok_s or not out_s:
+            return None, "execute-js-failed reading signature: " + (err_s or "empty result")
+        try:
+            r = _parse_js_json(out_s)
+        except ValueError as e:
+            return None, "json-parse-failed: %s" % e
+        if r.get("status") == "error":
+            return None, r.get("detail")
+        return r, None
+
+    snap1, err1 = _read_signature()
+    if snap1 is None:
+        _arc_execute_js(_cleanup_markers_js(), browser)
+        return make_envelope(False, "click", False, reason="signature-read-failed", detail=err1, target=target)
+    target["rect"] = snap1.get("rect")
+
+    ok2, out2, err2 = _arc_execute_js(_click_web_dispatch_js(), browser)
+    if not ok2 or not out2:
+        _arc_execute_js(_cleanup_markers_js(), browser)
+        return make_envelope(False, "click", False, reason="execute-js-failed",
+                              detail="dispatching click: " + (err2 or "empty result"), target=target)
+
+    time.sleep(0.12)
+    snap2, err2b = _read_signature()
+    if snap2 is None:
+        _arc_execute_js(_cleanup_markers_js(), browser)
+        return make_envelope(False, "click", False, reason="signature-read-failed", detail=err2b, target=target)
+
+    if snap2.get("signature") != snap1.get("signature"):
+        _arc_execute_js(_cleanup_markers_js(), browser)
+        return make_envelope(True, "click", True, verifiedBy="state-change", method="js",
+                              target=target, coords=None)
+
+    # Signature unchanged -- the dispatched click was ignored (the
+    # isTrusted-gated case Bug #5/#2 both hit). Escalate to a real click at
+    # the element's own rect, same primitive `select` uses.
+    def _verify_state_change():
+        snap3, err3 = _read_signature()
+        if snap3 is None:
+            return False, None, err3
+        changed = snap3.get("signature") != snap1.get("signature")
+        return changed, ("state-change" if changed else None), snap3
+
+    rc = real_click_verified(browser, snap1.get("rect") or {}, _verify_state_change)
+    _arc_execute_js(_cleanup_markers_js(), browser)
+    if rc["ok"]:
+        return make_envelope(True, "click", True, verifiedBy=rc["verifiedBy"], method="js->real-click",
+                              target=target, coords=rc["coords"])
+    return make_envelope(False, "click", False, method="js->real-click", target=target,
+                          coords=rc.get("coords"), reason=rc.get("reason", "not-verified-after-real-click"),
+                          detail=rc.get("detail"))
+
+
+def cmd_click(args):
+    if args.selector:
+        out = click_web(args.app or "Arc", args.selector, args.name, args.index)
+        print(json.dumps(out))
+        if not out.get("ok"):
+            sys.exit(1)
+        return
+
+    if not args.role or not args.name:
+        die("click needs --role and --name (native AX mode) or --selector (web mode)")
+
+    if args.double or args.right:
+        # AXPress has no double/right-click equivalent; go straight to the
+        # coordinate path for those.
+        el, err = find_one(args.role, args.name, args.index, args.app)
+        if err:
+            print(json.dumps(err))
+            sys.exit(1)
+        out = click_xy(el["cx"], el["cy"], args.double, args.right)
+        out["matchedElement"] = el
+        out["method"] = "coordinate-click"
+        print(json.dumps(out))
+        if "error" in out:
+            sys.exit(1)
+        return
+
+    press_out = ax_press(args.role, args.name, args.index, args.app)
+    if "error" not in press_out:
+        press_out["method"] = "ax-press"
+        print(json.dumps(press_out))
+        return
+
+    # AXPress failed or unsupported -- fall back to a coordinate click.
+    el, err = find_one(args.role, args.name, args.index, args.app)
+    if err:
+        err["axPressError"] = press_out.get("error")
+        print(json.dumps(err))
+        sys.exit(1)
+    out = click_xy(el["cx"], el["cy"])
+    out["matchedElement"] = el
+    out["method"] = "coordinate-click"
+    out["axPressError"] = press_out.get("error")
+    print(json.dumps(out))
+    if "error" in out:
+        sys.exit(1)
+
+
+def cmd_type(args):
+    if args.text == "":
+        # empty text is a legitimate no-op (e.g. a caller building the string
+        # programmatically that happened to end up empty), not an error.
+        out = {"ok": True, "noop": True}
+        if args.enter:
+            out["enterResult"] = run_jxa_key("return", {})
+        print(json.dumps(out))
+        return
+    out = cliclick("t:%s" % args.text)
+    if args.enter and "error" not in out:
+        key_out = run_jxa_key("return", {})
+        out["enterResult"] = key_out
+    print(json.dumps(out))
+    if "error" in out:
+        sys.exit(1)
+
+
+def cmd_key(args):
+    out = run_jxa_key(args.key, {
+        "cmd": args.cmd, "shift": args.shift,
+        "option": args.option, "control": args.control,
+    })
+    print(json.dumps(out))
+    if "error" in out:
+        sys.exit(1)
+
+
+def cmd_scroll(args):
+    # cliclick 5.1 has no scroll-wheel command (checked: no "s:"/scroll
+    # command exists in its help output). Approximate with repeated arrow-key
+    # presses via System Events -- scrolls most content views but is not a
+    # true wheel-delta event; some web widgets that specifically listen for
+    # wheel events may not respond. amount = number of key presses, not lines.
+    if args.amount < 0:
+        die("scroll --amount must be >= 0, got %d" % args.amount)
+    if args.amount == 0:
+        print(json.dumps({"ok": True, "presses": 0, "direction": args.direction, "noop": True}))
+        return
+    key = "down" if args.direction == "down" else "up"
+    results = []
+    for _ in range(args.amount):
+        results.append(run_jxa_key(key, {}))
+        time.sleep(0.02)
+    errored = [r for r in results if "error" in r]
+    out = {"ok": len(errored) == 0, "presses": len(results), "direction": args.direction}
+    if errored:
+        out["error"] = errored[0]["error"]
+    print(json.dumps(out))
+    if errored:
+        sys.exit(1)
+
+
+def cmd_wait(args):
+    if args.dom:
+        cmd_wait_dom(args)
+        return
+
+    deadline = time.time() + args.timeout
+    last_err = None
+    while time.time() < deadline:
+        el, err = find_one(args.role, args.name, args.index, args.app)
+        if el:
+            out = {"ok": True, "found": True, "element": el}
+            if args.click:
+                click_out = click_xy(el["cx"], el["cy"])
+                out["clickResult"] = click_out
+                if "error" in click_out:
+                    print(json.dumps(out))
+                    sys.exit(1)
+            print(json.dumps(out))
+            return
+        last_err = err
+        time.sleep(0.3)
+    out = {"ok": False, "found": False, "timedOut": True}
+    if last_err:
+        out["lastError"] = last_err
+    print(json.dumps(out))
+    sys.exit(1)
+
+
+def cmd_wait_dom(args):
+    """
+    Poll the Arc DOM (not the AX tree) every ~0.5s until an element matches.
+    For JS-rendered content (React/Svelte/etc. lazy-mounted buttons) that
+    the Accessibility tree can't see because it hasn't been walked/exposed
+    yet, or is a plain <div onclick> with no AX role at all.
+
+    --role matches against the element's HTML TAG (case-insensitive,
+    "any"/empty matches every tag); --name matches as a case-insensitive
+    substring of the element's visible text. This mirrors AX `wait`'s
+    role/name shape so callers don't have to learn a second vocabulary.
+    """
+    browser = args.app or "Arc"
+    deadline = time.time() + args.timeout
+    last_result = None
+    while time.time() < deadline:
+        result = dom_query(browser, DEFAULT_DOM_SELECTOR, 300, args.top_chrome, args.left_chrome)
+        if "error" in result:
+            last_result = result
+            time.sleep(0.5)
+            continue
+        role_wanted = (args.role or "any").lower()
+        name_wanted = (args.name or "").lower()
+        for el in result.get("elements", []):
+            tag_match = role_wanted in ("any", "") or (el.get("tag") or "").lower() == role_wanted
+            name_match = not name_wanted or name_wanted in (el.get("text") or "").lower()
+            if tag_match and name_match:
+                out = {"ok": True, "found": True, "element": el, "mode": "dom"}
+                if args.click and el.get("x") is not None:
+                    click_out = click_xy(el["x"], el["y"])
+                    out["clickResult"] = click_out
+                    if "error" in click_out:
+                        print(json.dumps(out))
+                        sys.exit(1)
+                print(json.dumps(out))
+                return
+        last_result = result
+        time.sleep(0.5)
+    out = {"ok": False, "found": False, "timedOut": True, "mode": "dom"}
+    if last_result:
+        out["lastDomQuery"] = last_result
+    print(json.dumps(out))
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# macro: stop-on-failure sequence of the actions above
+# ---------------------------------------------------------------------------
+
+def _run_macro_action_inner(action):
+    kind = action.get("action")
+    if kind == "click":
+        double = action.get("double", False)
+        right = action.get("right", False)
+        if not double and not right:
+            press_out = ax_press(action["role"], action["name"], action.get("index", 0),
+                                  action.get("app"))
+            if "error" not in press_out:
+                press_out["method"] = "ax-press"
+                return press_out
+        el, err = find_one(action["role"], action["name"], action.get("index", 0),
+                            action.get("app"))
+        if err:
+            return err
+        out = click_xy(el["cx"], el["cy"], double, right)
+        out["matchedElement"] = el
+        out["method"] = "coordinate-click"
+        return out
+    if kind == "click-xy":
+        return click_xy(action["x"], action["y"], action.get("double", False),
+                         action.get("right", False), action.get("fromView"))
+    if kind == "type":
+        text = action["text"]
+        if text == "":
+            return {"ok": True, "noop": True}
+        out = cliclick("t:%s" % text)
+        if action.get("enter") and "error" not in out:
+            out["enterResult"] = run_jxa_key("return", {})
+        return out
+    if kind == "key":
+        return run_jxa_key(action["key"], {
+            "cmd": action.get("cmd", False), "shift": action.get("shift", False),
+            "option": action.get("option", False), "control": action.get("control", False),
+        })
+    if kind == "wait":
+        if action.get("dom"):
+            browser = action.get("app") or "Arc"
+            deadline = time.time() + action.get("timeout", 10)
+            role_wanted = (action.get("role") or "any").lower()
+            name_wanted = (action.get("name") or "").lower()
+            while time.time() < deadline:
+                result = dom_query(browser, DEFAULT_DOM_SELECTOR, 300,
+                                    action.get("topChrome"), action.get("leftChrome"))
+                if "error" not in result:
+                    for el in result.get("elements", []):
+                        tag_match = role_wanted in ("any", "") or (el.get("tag") or "").lower() == role_wanted
+                        name_match = not name_wanted or name_wanted in (el.get("text") or "").lower()
+                        if tag_match and name_match:
+                            if action.get("click") and el.get("x") is not None:
+                                return click_xy(el["x"], el["y"])
+                            return {"ok": True, "found": True, "element": el, "mode": "dom"}
+                time.sleep(0.5)
+            return {"error": "dom wait timed out for role=%s name=%s"
+                              % (action.get("role"), action.get("name"))}
+        deadline = time.time() + action.get("timeout", 10)
+        while time.time() < deadline:
+            el, err = find_one(action["role"], action["name"], action.get("index", 0),
+                                action.get("app"))
+            if el:
+                if action.get("click"):
+                    return click_xy(el["cx"], el["cy"])
+                return {"ok": True, "found": True, "element": el}
+            time.sleep(0.3)
+        return {"error": "wait timed out for role=%s name=%s" % (action.get("role"), action.get("name"))}
+    if kind == "focus":
+        return run_jxa_ax("activate", {"app": action["app"]})
+    return {"error": "unknown macro action: " + str(kind)}
+
+
+def run_macro_action(action):
+    """
+    Wraps _run_macro_action_inner so a malformed action (missing a required
+    key like "role"/"name"/"text"/"app", a KeyError) becomes a clean
+    stop-on-failure JSON error instead of an uncaught traceback escaping
+    past cmd_macro's `if "error" in out` check.
+    """
+    try:
+        return _run_macro_action_inner(action)
+    except Exception as e:
+        return {"error": "malformed action: %s (action was: %s)" % (e, json.dumps(action))}
+
+
+def cmd_macro(args):
+    try:
+        actions = json.loads(args.actions_json)
+    except ValueError as e:
+        die("invalid macro JSON: %s" % e)
+    if not isinstance(actions, list):
+        die("macro JSON must be an array of action objects")
+
+    results = []
+    for i, action in enumerate(actions):
+        out = run_macro_action(action)
+        action_kind = action.get("action") if isinstance(action, dict) else None
+        results.append({"index": i, "action": action_kind, "result": out})
+        if "error" in out:
+            print(json.dumps({"ok": False, "stoppedAt": i, "results": results}))
+            sys.exit(1)
+    print(json.dumps({"ok": True, "results": results}))
+
+
+# ---------------------------------------------------------------------------
+# screenshot: vision fallback
+# ---------------------------------------------------------------------------
+
+def cmd_screenshot(args):
+    scratchpad_default = os.path.join(tempfile.gettempdir(), "desktop-cli-scratchpad")
+    scratchpad = os.environ.get("ATLAS_SCRATCHPAD", scratchpad_default)
+    ts = int(time.time())
+    out_path = args.outpath or os.path.join(scratchpad, "shot_%d.jpg" % ts)
+    raw_png = "/tmp/desktop_shot_raw_%d.png" % ts
+
+    # A bare filename (no directory component) makes os.path.dirname return
+    # "", which os.makedirs("") used to raise on -- fall back to "." (the
+    # cwd, which always exists) instead of crashing.
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    # Display resolution (Bug #3 fix): "auto" (the default) resolves WHICH
+    # display --app's window is actually on via resolve_window_display(),
+    # instead of always assuming display 1 -- a screenshot used to always
+    # come back "display 1" downsampled regardless of which physical
+    # display the window was really on, hiding the real click-landing
+    # question during the live UXCam session. An explicit --display N
+    # (1-based, matching screencapture's -D numbering) still overrides.
+    display_resolution_note = None
+    if args.display == "auto":
+        info = resolve_window_display(args.app) if _is_app_running(args.app) else None
+        if info and info.get("screenIndex") is not None and info.get("trustworthy"):
+            resolved_display = info["screenIndex"] + 1  # screencapture -D is 1-based
+        else:
+            resolved_display = 1
+            display_resolution_note = ("could not resolve %s's active display (app not running, "
+                                        "no window, or untrustworthy screen match), fell back to "
+                                        "display 1" % args.app)
+    else:
+        try:
+            resolved_display = int(args.display)
+        except (TypeError, ValueError):
+            die("--display must be 'auto' or an integer, got %r" % args.display)
+
+    # Pin the capture to ONE display (-D, 1-based). Without -D, screencapture
+    # on a multi-display setup stitches ALL displays into a single image,
+    # which silently breaks --from-view scaling (click_xy's screen width
+    # query is single-display). -C composites the live cursor into the
+    # capture (see the open item in the rebuild spec about verifying this
+    # on this macOS -- cursor position is ALSO reported numerically below
+    # regardless, so a caller isn't dependent on the composite working).
+    cap = subprocess.run(["/usr/sbin/screencapture", "-x", "-C", "-D", str(resolved_display), raw_png],
+                          capture_output=True, text=True)
+    if cap.returncode != 0:
+        die("screencapture failed: " + cap.stderr.strip())
+
+    sip = subprocess.run(
+        ["/usr/bin/sips", "-Z", "1600", "-s", "format", "jpeg", "-s", "formatOptions", "60",
+         raw_png, "--out", out_path],
+        capture_output=True, text=True,
+    )
+    try:
+        os.remove(raw_png)
+    except OSError:
+        pass
+    if sip.returncode != 0:
+        die("sips downsample failed: " + sip.stderr.strip())
+
+    out = {"ok": True, "path": out_path, "viewWidth": 1600, "display": resolved_display,
+           "cursor": _cliclick_cursor_position()}
+    if display_resolution_note:
+        out["displayResolutionNote"] = display_resolution_note
+    print(json.dumps(out))
+
+
+# ---------------------------------------------------------------------------
+# calibrate: self-verifying top-chrome AND left-chrome measurement. INJECTS
+# INPUT (clicks), only run this when the desktop is confirmed free -- see
+# README.
+#
+# DESIGN NOTE (revised twice): a first version opened a throwaway tab at a
+# data:text/html page and coarse-swept candidate top_chrome values with
+# multiple clicks. A live run found Arc's AppleScript dictionary REJECTS
+# data:/about:blank URLs on `make new tab` (error -1701, "Please provide a
+# valid URL property") -- it only accepts real http(s) URLs. That live run
+# also confirmed injecting an overlay into a tab and reading its rect back
+# via `execute javascript` works perfectly, which drove a redesign to an
+# IN-PLACE, single-corrective-click approach for the Y axis (top_chrome)
+# only, the X axis (left_chrome) was still just assumed equal to
+# (outerW - innerW). A SECOND live run of that Y-only version converged Y
+# perfectly (top_chrome corrected 52 -> 42, confirmed within 3px) but
+# revealed the X assumption was ALSO wrong: the confirming click was off by
+# a constant ~90pt on X (modeled left chrome 327 vs the page reporting the
+# click landed as if the real left chrome were 417). So this now corrects
+# BOTH axes from the SAME single click, no second round needed:
+#
+#   1. Inject a FULL-VIEWPORT fixed overlay (position:fixed; inset:0;
+#      z-index:2147483647) into the active tab. Because it covers the whole
+#      viewport, a click ANYWHERE on the page lands on the overlay and
+#      CANNOT leak through to the real page underneath -- click-safe even if
+#      the current top_chrome/left_chrome guesses are wildly wrong, whatever
+#      tab is open is protected.
+#   2. Compute the absolute screen point for a known viewport target
+#      (CALIBRATION_TARGET_VX/VY) using the CURRENT top_chrome AND
+#      left_chrome guesses, click it once, then read back
+#      window.__atlas_cal, which the overlay's own click handler set to the
+#      click's REAL clientX/clientY as the page itself sees it.
+#   3. The gap between where we AIMED (the known target) and where the page
+#      says the click actually landed is exactly the chrome error, on BOTH
+#      axes independently. Correct both once, click again to confirm within
+#      ~3px on BOTH axes, remove the overlay, persist. No sweep needed on
+#      either axis.
+#
+# SIGN DERIVATION (so the correction isn't just an asserted guess, worked
+# out identically on both axes from this toolkit's own formulas):
+#   absScreenY = windowY + top_chrome  + viewportY
+#   absScreenX = windowX + left_chrome + viewportX
+# We told cliclick to click at
+#   absScreenY_target = windowY + top_chrome_guess  + target_vy
+#   absScreenX_target = windowX + left_chrome_guess + target_vx
+# and the page reports that SAME physical point corresponds to viewport
+# (reported_clientX, reported_clientY), via the SAME formulas but with the
+# TRUE offsets, so on Y:
+#   windowY + top_chrome_guess + target_vy == windowY + top_chrome_true + reported_clientY
+#     => top_chrome_true = top_chrome_guess - (reported_clientY - target_vy)
+# and identically on X:
+#   windowX + left_chrome_guess + target_vx == windowX + left_chrome_true + reported_clientX
+#     => left_chrome_true = left_chrome_guess - (reported_clientX - target_vx)
+# i.e. true = guess - delta, delta = reported - target, same sign on both axes.
+# Y sanity-checked with numbers and CONFIRMED LIVE (true=52 measured as 52,
+# from a guess of 30: delta=178-200=-22, guess-delta=30-(-22)=52, matches;
+# separately the second live run measured true=42 from guess=52 and
+# converged perfectly). X sanity-checked with the SECOND live run's own
+# numbers: guess=327, target_vx=200, reported_clientX=110 (both clicks,
+# uncorrected): left_chrome_true = 327 - (110-200) = 327 + 90 = 417, matching
+# the live diagnosis exactly.
+#
+# A `--method newtab` fallback is kept (see _open_calibration_tab_http)
+# for the rare case in-place injection isn't viable (e.g. a page whose CSP
+# blocks inline style/script injection); it needs network (a real http(s)
+# URL, data:/about:blank are rejected) and is otherwise the same
+# single-click overlay technique, just run against a fresh blank-ish tab
+# instead of whatever's currently open.
+# ---------------------------------------------------------------------------
+
+CALIBRATION_TARGET_VX = 200
+CALIBRATION_TARGET_VY = 200
+CALIBRATION_CONFIRM_TOLERANCE_PX = 3
+CALIBRATION_FALLBACK_URL = "https://example.com"
+
+
+def _arc_inject_calibration_overlay(browser, target_vx, target_vy):
+    """
+    Adds a full-viewport, top-z-index, click-catching overlay to the active
+    tab, plus a small visible marker at (target_vx, target_vy) for anyone
+    watching the screen during a live run. The overlay's click handler
+    records event.clientX/clientY (the page's own view of where the click
+    landed) into window.__atlas_cal, overwriting it on every click, so each
+    click's result can be read back fresh with no reset needed in between.
+    """
+    js = (
+        "(function(){"
+        "var old=document.getElementById('__atlas_cal_overlay');if(old)old.remove();"
+        "window.__atlas_cal=null;"
+        "var ov=document.createElement('div');"
+        "ov.id='__atlas_cal_overlay';"
+        "ov.style.cssText='position:fixed;inset:0;z-index:2147483647;"
+        "background:rgba(0,0,0,0.001);cursor:crosshair;';"
+        "ov.addEventListener('click',function(e){"
+        "window.__atlas_cal={clientX:e.clientX,clientY:e.clientY};"
+        "e.preventDefault();e.stopPropagation();"
+        "},true);"
+        "var mk=document.createElement('div');"
+        "mk.style.cssText='position:fixed;left:%dpx;top:%dpx;width:10px;height:10px;"
+        "border-radius:50%%;background:red;pointer-events:none;';"
+        "ov.appendChild(mk);"
+        "document.body.appendChild(ov);"
+        "return true;"
+        "})()"
+    ) % (target_vx - 5, target_vy - 5)
+    ok, out, err = _arc_execute_js(js, browser)
+    if not ok or out in ("missing value", ""):
+        return False, err or "overlay injection returned no result"
+    return True, None
+
+
+def _arc_read_calibration_click(browser):
+    """Read back window.__atlas_cal; None if no click has landed on the overlay yet."""
+    ok, out, _err = _arc_execute_js("JSON.stringify(window.__atlas_cal)", browser)
+    if not ok or not out:
+        return None
+    try:
+        decoded = json.loads(out) if out.startswith('"') else out
+        parsed = json.loads(decoded)
+    except ValueError:
+        return None
+    return parsed  # dict {clientX, clientY}, or None if JSON.stringify(null) decoded to None
+
+
+def _arc_remove_calibration_overlay(browser):
+    """Best-effort cleanup: removes the overlay/marker, leaves nothing behind on the page."""
+    js = ("(function(){var ov=document.getElementById('__atlas_cal_overlay');"
+          "if(ov)ov.remove();try{delete window.__atlas_cal;}catch(e){window.__atlas_cal=undefined;}"
+          "return true;})()")
+    _arc_execute_js(js, browser)
+
+
+def _open_calibration_tab_http(browser, url=CALIBRATION_FALLBACK_URL):
+    """
+    FALLBACK path only (--method newtab): opens a NEW tab at a real http(s)
+    URL (data:/about:blank are rejected by Arc's AppleScript dictionary with
+    error -1701, confirmed live) and does NOT touch the caller's existing
+    active tab. New tabs become the active tab by default in Chromium-family
+    browsers, so the subsequent `execute javascript` calls (which always
+    target "front window's active tab", never the `make new tab` return
+    value, which comes back as `missing value` and can't be addressed
+    directly, confirmed live as error -1708) reach it correctly without any
+    extra tab-by-index bookkeeping. Needs network. Returns (ok, error).
+    """
+    literal = url.replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        'tell application "%s" to tell front window to make new tab '
+        'with properties {URL:"%s"}'
+    ) % (browser, literal)
+    proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return False, proc.stderr.strip()
+    return True, None
+
+
+def _close_calibration_tab(browser):
+    """
+    FALLBACK path only: best-effort close of whatever is currently the
+    active tab (our throwaway tab, assuming nothing else changed the active
+    tab in between). Chromium-family browsers typically reactivate whatever
+    was active before the closed one was opened, but that's the browser's
+    own behavior, not something this script enforces or verifies.
+    """
+    subprocess.run(
+        ["osascript", "-e", 'tell application "%s" to tell front window to close active tab' % browser],
+        capture_output=True, text=True,
+    )
+
+
+def _run_single_click_calibration(browser, ax_frame, top_chrome_guess, left_chrome_guess):
+    """
+    The shared in-place, single-click calibration routine, used by both the
+    default (--method inplace) and fallback (--method newtab) flows once
+    they've each set up which tab to run it against. Corrects BOTH axes from
+    one click (a live run found the X-axis default guess, outerW-innerW,
+    was also wrong, off by ~90pt, not just the Y-axis one this was
+    originally built to fix). Returns a result dict; caller is responsible
+    for cleanup (removing the overlay / closing the fallback tab) and for
+    persisting the result via save_calibration().
+
+    ax_frame is the AX-reported window frame (Fix #1 ground truth, see
+    _viewport_to_screen) -- window.screenX/screenY/outerWidth/outerHeight
+    are NEVER used for the click-point math or the bounds guard here, same
+    reasoning as everywhere else in this file: under a hardware-mirrored
+    display they report the full mirrored display's origin/size, not the
+    real window's.
+    """
+    ok, inject_err = _arc_inject_calibration_overlay(browser, CALIBRATION_TARGET_VX, CALIBRATION_TARGET_VY)
+    if not ok:
+        return {"ok": False, "error": "could not inject calibration overlay: " + str(inject_err)}
+
+    abs_x_first = ax_frame["x"] + left_chrome_guess + CALIBRATION_TARGET_VX
+    abs_y_first = ax_frame["y"] + top_chrome_guess + CALIBRATION_TARGET_VY
+
+    # Safety bound: refuse to click outside the window's own screen rect on
+    # EITHER axis. The overlay only protects clicks that land somewhere IN
+    # the tab's viewport, if a badly wrong guess would send the click
+    # entirely outside the browser window (onto the menu bar, another app,
+    # off-screen), abort before clicking rather than trust the overlay to
+    # save it.
+    x_in_bounds = ax_frame["x"] <= abs_x_first <= ax_frame["x"] + ax_frame["w"]
+    y_in_bounds = ax_frame["y"] <= abs_y_first <= ax_frame["y"] + ax_frame["h"]
+    if not (x_in_bounds and y_in_bounds):
+        _arc_remove_calibration_overlay(browser)
+        return {"ok": False, "error": "computed calibration click point (%d,%d) falls outside "
+                                       "the window's own bounds, aborted before clicking for safety"
+                                       % (abs_x_first, abs_y_first)}
+
+    click_xy(abs_x_first, abs_y_first)
+    time.sleep(0.15)
+    reported1 = _arc_read_calibration_click(browser)
+
+    if not reported1:
+        _arc_remove_calibration_overlay(browser)
+        return {"ok": False, "error": "overlay reported no click (listener may not have fired, "
+                                       "or the tab navigated away mid-calibration)"}
+
+    # Same derivation on both axes, from this toolkit's own formulas
+    # (absScreenY = windowY + top_chrome + viewportY,
+    #  absScreenX = windowX + left_chrome + viewportX): the point we AIMED
+    # at, using the guessed offset, and the point the page reports the
+    # click actually landed at (using the TRUE offset) are the same
+    # physical screen point, solving for the true offset gives
+    # true = guess - (reported - target) on each axis independently.
+    delta_y = reported1["clientY"] - CALIBRATION_TARGET_VY
+    delta_x = reported1["clientX"] - CALIBRATION_TARGET_VX
+    corrected_top_chrome = top_chrome_guess - delta_y
+    corrected_left_chrome = left_chrome_guess - delta_x
+
+    # Confirming second click at BOTH corrected offsets.
+    abs_x_second = ax_frame["x"] + corrected_left_chrome + CALIBRATION_TARGET_VX
+    abs_y_second = ax_frame["y"] + corrected_top_chrome + CALIBRATION_TARGET_VY
+    click_xy(abs_x_second, abs_y_second)
+    time.sleep(0.15)
+    reported2 = _arc_read_calibration_click(browser)
+
+    _arc_remove_calibration_overlay(browser)
+
+    confirmed = bool(
+        reported2
+        and abs(reported2["clientY"] - CALIBRATION_TARGET_VY) <= CALIBRATION_CONFIRM_TOLERANCE_PX
+        and abs(reported2["clientX"] - CALIBRATION_TARGET_VX) <= CALIBRATION_CONFIRM_TOLERANCE_PX
+    )
+
+    result = {
+        "ok": confirmed,
+        "topChrome": corrected_top_chrome,
+        "leftChrome": corrected_left_chrome,
+        "firstClick": {"absPoint": [abs_x_first, abs_y_first], "reported": reported1,
+                        "topChromeGuess": top_chrome_guess, "leftChromeGuess": left_chrome_guess,
+                        "deltaY": delta_y, "deltaX": delta_x},
+        "secondClick": {"absPoint": [abs_x_second, abs_y_second], "reported": reported2},
+    }
+    if not confirmed:
+        result["error"] = ("second confirming click did not land within %dpx of the target on "
+                            "both axes, not persisting -- see firstClick/secondClick"
+                            % CALIBRATION_CONFIRM_TOLERANCE_PX)
+    return result
+
+
+def _reset_browser_zoom(browser):
+    """
+    Resets page zoom to 100% (Cmd+0). Page zoom is a purely visual/CSS-pixel
+    setting -- it does not touch form field values, scroll position, or
+    navigation state, so this is safe to send mid-session. `calibrate`'s
+    overlay-click math (CALIBRATION_TARGET_VX/VY added directly, no zoom
+    scaling) assumes 1 CSS px == 1 physical point, i.e. 100% zoom, so this
+    guarantees a clean calibration run regardless of whatever zoom level a
+    tab happened to be left at; `dom`'s separate zoom-normalization (see
+    dom_query()'s docstring) is what makes READING coordinates safe at any
+    zoom afterward, calibration itself still needs a known 100% baseline.
+    """
+    run_jxa_ax("activate", {"app": browser})
+    time.sleep(0.1)
+    run_jxa_key("0", {"cmd": True})
+    time.sleep(0.2)
+
+
+def cmd_calibrate(args):
+    browser = args.app
+
+    if not _is_app_running(browser):
+        die("%s is not running, calibrate needs it open with at least one tab" % browser)
+
+    _reset_browser_zoom(browser)
+
+    opened_fallback_tab = False
+    if args.method == "newtab":
+        opened, open_err = _open_calibration_tab_http(browser)
+        if not opened:
+            die("could not open the fallback calibration tab in %s (needs a real http(s) URL, "
+                "data:/about:blank are rejected): %s" % (browser, open_err))
+        opened_fallback_tab = True
+        time.sleep(1.0)  # let the real page load over the network before injecting
+
+    # ax_frame (Fix #1 ground truth) drives all the click-point math below;
+    # win_metrics (JS self-report) is kept only for innerW/innerH/dpr, see
+    # get_top_chrome/get_left_chrome/save_calibration.
+    ax_frame = _arc_window_geometry(browser)
+    win_metrics = _dom_window_metrics(browser)
+    if not ax_frame or not win_metrics:
+        if opened_fallback_tab:
+            _close_calibration_tab(browser)
+        die("could not read window geometry for calibration (is a tab active in %s?)" % browser)
+
+    top_chrome_guess, _tcal, _tsrc, _tstale = get_top_chrome(browser, ax_frame, win_metrics, None)
+    left_chrome_guess, _lcal, _lsrc, _lstale = get_left_chrome(browser, ax_frame, win_metrics, None)
+
+    result = _run_single_click_calibration(browser, ax_frame, top_chrome_guess, left_chrome_guess)
+
+    if opened_fallback_tab:
+        _close_calibration_tab(browser)
+
+    if not result["ok"]:
+        print(json.dumps(result))
+        sys.exit(1)
+
+    # Stamp WHICH display/backing-scale this measurement is only valid on
+    # (Bug #3 fix): a calibration silently applied after the window moved to
+    # a different display was the root cause of the intermittent clicks.
+    backing_scale, zoom_scale_trustworthy, screen_index = _screen_backing_scale_factor(ax_frame)
+    display_index = screen_index if zoom_scale_trustworthy else None
+    backing_scale_stamp = backing_scale if zoom_scale_trustworthy else None
+
+    save_calibration(browser, result["topChrome"], result["leftChrome"], ax_frame, win_metrics,
+                      display_index, backing_scale_stamp)
+    result["savedTo"] = CALIBRATION_FILE
+    result["displayIndex"] = display_index
+    result["backingScale"] = backing_scale_stamp
+    print(json.dumps(result))
+
+
+# ---------------------------------------------------------------------------
+# argparse wiring
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="desktop",
+        description="Universal macOS desktop-control CLI (native AX tree + Arc DOM + vision fallback).",
+    )
+    sub = p.add_subparsers(dest="subcommand", required=True)
+
+    sub.add_parser("list-apps", help="list running GUI apps")
+
+    sp = sub.add_parser("focus", help="bring an app to the foreground")
+    sp.add_argument("--app", required=True)
+
+    sp = sub.add_parser("windows", help="list windows of an app (default: frontmost)")
+    sp.add_argument("--app", default=None)
+
+    sp = sub.add_parser("find", help="query the AX tree for matching elements")
+    sp.add_argument("--role", default="any",
+                     help="button|textfield|checkbox|radiobutton|popupbutton|combobox|"
+                          "menuitem|link|statictext|tab|row|cell|slider|any")
+    sp.add_argument("--name", default=None, help="case-insensitive substring match")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--app", default=None, help="default: frontmost app")
+    sp.add_argument("--window-index", type=int, default=0)
+
+    sp = sub.add_parser("dom", help="query the active tab's web page DOM (Arc only)")
+    sp.add_argument("--app", default="Arc")
+    sp.add_argument("--selector", default=DEFAULT_DOM_SELECTOR)
+    sp.add_argument("--limit", type=int, default=200)
+    sp.add_argument("--top-chrome", type=int, default=None, dest="top_chrome",
+                     help="override the calibrated/guessed top-chrome height in points "
+                          "(skips .calibration.json lookup)")
+    sp.add_argument("--left-chrome", type=int, default=None, dest="left_chrome",
+                     help="override the calibrated/guessed left-chrome width in points "
+                          "(skips .calibration.json lookup)")
+
+    sp = sub.add_parser("select", help="set a dropdown's value -- native <select> via JS "
+                                        ".value + change event (no click at all); custom ARIA/"
+                                        "react-select-style combobox via JS open+filter+poll "
+                                        "THEN a REAL cliclick commit at the option's own rect "
+                                        "(dispatched clicks are ignored by these widgets, "
+                                        "confirmed live). Never opens the native OS <select> "
+                                        "popup that CGEvents can't drive")
+    sp.add_argument("--app", default="Arc")
+    sp.add_argument("--selector", default=DEFAULT_SET_SELECT_SELECTOR,
+                     help="CSS selector for candidate dropdown elements, default matches "
+                          "native <select> AND common ARIA-combobox trigger patterns")
+    sp.add_argument("--name", default=None,
+                     help="case-insensitive substring match against the element's name/id/"
+                          "aria-label/associated-<label>-text (or, for a combobox, its own "
+                          "visible text), to disambiguate multiple dropdowns on the page")
+    sp.add_argument("--index", type=int, default=0,
+                     help="which matching element to use, 0-based, after --name filtering")
+    sp.add_argument("--value", required=True,
+                     help="option to select: matched by exact visible text first, then "
+                          "substring visible text, then (native <select> only) exact option "
+                          "value")
+    sp.add_argument("--retries", type=int, default=3,
+                     help="combobox mode only: re-open and retry the whole open+poll+real-click "
+                          "cycle this many times if the real click didn't verify")
+
+    sp = sub.add_parser("set-select", help="DEPRECATED alias for `select`, kept for one release. "
+                                            "Same behavior, no --retries flag (uses the default)")
+    sp.add_argument("--app", default="Arc")
+    sp.add_argument("--selector", default=DEFAULT_SET_SELECT_SELECTOR)
+    sp.add_argument("--name", default=None)
+    sp.add_argument("--index", type=int, default=0)
+    sp.add_argument("--value", required=True)
+
+    sp = sub.add_parser("fill", help="set a web input/textarea's value via the React-safe "
+                                      "native property setter + input/change/blur (Arc only). "
+                                      "Replaces `type` for web content -- synthetic keystrokes "
+                                      "never reached a single Arc web input, confirmed live; "
+                                      "this is the fix. Verifies by reading el.value back, and "
+                                      "watches for a validation-error node so a value that "
+                                      "reached the form store but a validator still rejects "
+                                      "surfaces as a hand-to-human escalation, not a false ok")
+    sp.add_argument("selector", help="CSS selector for the target input/textarea/select")
+    sp.add_argument("value", help="value to set")
+    sp.add_argument("--name", default=None,
+                     help="case-insensitive substring filter against the element's name/id/"
+                          "aria-label/label text, to disambiguate multiple matches")
+    sp.add_argument("--index", type=int, default=0,
+                     help="which matching element to use, 0-based, after --name filtering")
+    sp.add_argument("--enter", action="store_true", help="press Return after a verified fill")
+    sp.add_argument("--app", default="Arc")
+    sp.add_argument("--await-human", type=float, default=None, dest="await_human",
+                     help="if a hand-to-human escalation fires, poll the field for up to this "
+                          "many seconds for the error to clear (a human typing it manually) "
+                          "instead of returning immediately")
+    sp.add_argument("--no-verify", action="store_true", dest="no_verify",
+                     help="skip the read-back verification (faster, but per the envelope's "
+                          "ok==verified rule, ok can never be true when this is set)")
+
+    sp = sub.add_parser("click", help="find an element by role+name (native AX apps), or by "
+                                       "--selector (web content in Arc), then click it")
+    sp.add_argument("--role", default=None, help="required unless --selector is given")
+    sp.add_argument("--name", default=None,
+                     help="AX name substring (native mode, required unless --selector), or a "
+                          "case-insensitive substring filter against the matched web element "
+                          "(--selector mode, optional)")
+    sp.add_argument("--index", type=int, default=0)
+    sp.add_argument("--app", default=None)
+    sp.add_argument("--double", action="store_true")
+    sp.add_argument("--right", action="store_true")
+    sp.add_argument("--selector", default=None,
+                     help="web mode (Arc only): CSS selector for the target element. Tries a "
+                          "dispatched JS click first, escalates to a REAL click at the element's "
+                          "rect if its own state didn't change (isTrusted-gated widgets)")
+
+    sp = sub.add_parser("click-xy", help="click raw screen coordinates")
+    sp.add_argument("x", type=int)
+    sp.add_argument("y", type=int)
+    sp.add_argument("--double", action="store_true")
+    sp.add_argument("--right", action="store_true")
+    sp.add_argument("--from-view", type=int, default=None, dest="from_view",
+                     help="if coords were read off a screenshot shrunk to this width, scale up")
+
+    sp = sub.add_parser("type", help="type text at the current focus. NATIVE APPS ONLY -- "
+                                      "does NOT reach browser web inputs (confirmed live: "
+                                      "synthetic keystrokes never put a character into a "
+                                      "focused Arc web input). Use `fill` for web content")
+    sp.add_argument("--text", required=True)
+    sp.add_argument("--enter", action="store_true", help="press return after typing")
+
+    sp = sub.add_parser("key", help="press a key combo")
+    sp.add_argument("--key", required=True,
+                     help="a character, or a named key: return/enter/tab/space/delete/"
+                          "escape/left/right/up/down/home/end/pageup/pagedown/forwarddelete")
+    sp.add_argument("--cmd", action="store_true")
+    sp.add_argument("--shift", action="store_true")
+    sp.add_argument("--option", action="store_true")
+    sp.add_argument("--control", action="store_true")
+
+    sp = sub.add_parser("scroll", help="approximate scroll via repeated arrow-key presses")
+    sp.add_argument("--direction", required=True, choices=["up", "down"])
+    sp.add_argument("--amount", type=int, default=5, help="number of key presses, not lines")
+
+    sp = sub.add_parser("wait", help="poll locally until an element appears")
+    sp.add_argument("--role", required=True,
+                     help="AX role (see `find`), or with --dom: an HTML tag / 'any'")
+    sp.add_argument("--name", required=True,
+                     help="AX name substring, or with --dom: page-text substring")
+    sp.add_argument("--index", type=int, default=0)
+    sp.add_argument("--app", default=None)
+    sp.add_argument("--timeout", type=float, default=10.0)
+    sp.add_argument("--click", action="store_true", help="click the element once found")
+    sp.add_argument("--dom", action="store_true",
+                     help="poll the Arc DOM instead of the AX tree, for JS-rendered "
+                          "content (React/Svelte lazy-mounted buttons) the AX tree can't see")
+    sp.add_argument("--top-chrome", type=int, default=None, dest="top_chrome",
+                     help="(--dom mode only) override the calibrated/guessed top-chrome height")
+    sp.add_argument("--left-chrome", type=int, default=None, dest="left_chrome",
+                     help="(--dom mode only) override the calibrated/guessed left-chrome width")
+
+    sp = sub.add_parser("macro", help="run a stop-on-failure JSON action sequence")
+    sp.add_argument("actions_json")
+
+    sp = sub.add_parser("screenshot", help="FALLBACK: full-screen capture, downsampled")
+    sp.add_argument("outpath", nargs="?", default=None)
+    sp.add_argument("--display", default="auto",
+                     help="'auto' (default): resolves whichever display --app's window is "
+                          "actually on. Or a 1-based display index, matching screencapture's "
+                          "-D numbering, to force a specific one.")
+    sp.add_argument("--app", default="Arc", help="which app's window --display auto resolves against")
+
+    sp = sub.add_parser("calibrate", help="INJECTS INPUT: auto-measure Arc's top-chrome height "
+                                           "with one corrective click, no screenshot")
+    sp.add_argument("--app", default="Arc")
+    sp.add_argument("--method", choices=["inplace", "newtab"], default="inplace",
+                     help="inplace (default): calibrate on the CURRENT active tab via a "
+                          "click-safe full-viewport overlay, no new tab, no network. "
+                          "newtab: fallback, opens a throwaway http(s) tab first (needs network)")
+
+    return p
+
+
+DISPATCH = {
+    "list-apps": cmd_list_apps,
+    "focus": cmd_focus,
+    "windows": cmd_windows,
+    "find": cmd_find,
+    "dom": cmd_dom,
+    "set-select": cmd_set_select,
+    "select": cmd_select,
+    "fill": cmd_fill,
+    "click": cmd_click,
+    "click-xy": cmd_click_xy,
+    "type": cmd_type,
+    "key": cmd_key,
+    "scroll": cmd_scroll,
+    "wait": cmd_wait,
+    "macro": cmd_macro,
+    "screenshot": cmd_screenshot,
+    "calibrate": cmd_calibrate,
+}
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    DISPATCH[args.subcommand](args)
+
+
+if __name__ == "__main__":
+    main()

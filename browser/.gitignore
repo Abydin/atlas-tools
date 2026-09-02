@@ -1,0 +1,29 @@
+node_modules/
+
+# Chromium's persistent profile. Never Arc's profile, never committed.
+state/user-data-dir/
+# Exported login cookies. A secret: see README.md "Session persistence".
+state/storageState.json
+state/server.pid
+# Durable escalation log, real runtime data, not source.
+state/escalations.jsonl
+# Proxy/VPN exit profiles - real credentials once filled in, no file shipped.
+state/proxies.json
+# Bearer token for the HTTP API. A secret: see lib/auth.js + README.
+state/token
+# Staged files for upload() - real resumes land here at runtime, never source.
+state/uploads/
+
+# Per-run audit trail (transcripts + screenshots). Durable but not source,
+# lives on disk under this dir; not meant to bloat the repo.
+artifacts/*/
+
+logs/
+
+# test scratch (created and torn down by test/smoke.js)
+test/.scratch-state/
+test/.scratch-artifacts/
+test/.scratch-state-roundtrip/
+test/.scratch-escalations.jsonl
+test/.scratch-outside/
+test/fixture.txt

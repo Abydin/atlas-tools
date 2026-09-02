@@ -1,0 +1,7 @@
+{
+  "ytdlp_path": "~/.local/bin/yt-dlp",
+  "node_path": null,
+  "timeout_seconds": 120,
+  "auto_retry_with_cookies": false,
+  "default_cookies_browser": "chrome"
+}
