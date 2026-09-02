@@ -32,6 +32,14 @@ from safety import sanitize_untrusted
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# The only browsers yt-dlp's --cookies-from-browser is ever invoked with
+# here, matching every usage string in this file. This is argv, not a
+# shell, so an unvalidated value can't inject a command - but the usage
+# text already promises this allowlist, so a typo'd or arbitrary value
+# should fail fast with a clear error instead of being handed straight to
+# yt-dlp to reject on its own terms.
+SUPPORTED_COOKIE_BROWSERS = ("chrome", "safari", "firefox")
+
 _DEFAULTS = {
     "ytdlp_path": "~/.local/bin/yt-dlp",
     "node_path": None,
@@ -173,6 +181,10 @@ def _flag_val(name):
 
 if __name__ == "__main__":
     ck = _flag_val("--cookies")
+    if ck is not None and ck not in SUPPORTED_COOKIE_BROWSERS:
+        print(f"error: --cookies must be one of {'|'.join(SUPPORTED_COOKIE_BROWSERS)}, got {ck!r}", file=sys.stderr)
+        print("usage: fetch_media.py <url> [--cookies chrome|safari|firefox]", file=sys.stderr)
+        sys.exit(1)
     args = [a for a in sys.argv[1:] if not a.startswith("--") and a != ck]
     if not args:
         print("usage: fetch_media.py <url> [--cookies chrome|safari|firefox]", file=sys.stderr)
