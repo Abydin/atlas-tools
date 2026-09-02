@@ -26,8 +26,10 @@ here, each self-contained (its own README, its own install step).
 ## Bug reports
 
 Open an issue with: what you ran, what you expected, what happened instead,
-and your OS/runtime versions. For `desktop/`, that's the macOS version; for
-`browser/`, the Node version; for `fetch-media/`, the yt-dlp version.
+and your OS/runtime versions. For `browser/`, that's the Node version; for
+`fetch-media/`, the yt-dlp version. `desktop` moved to its own repo,
+[github.com/Abydin/atlas-desktop](https://github.com/Abydin/atlas-desktop),
+file issues there.
 
 ## Security
 
