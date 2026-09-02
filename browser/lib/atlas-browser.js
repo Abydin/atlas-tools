@@ -398,12 +398,17 @@ class AtlasBrowser {
       const summary = await this.openSession({ god: r.god, label: r.label });
       // URLs observed in an existing context are still untrusted at restore
       // time: DNS can change between the original navigation and this fresh
-      // context. Go through open(), rather than calling page.goto() directly,
-      // so the full scheme, resolved-destination, and actual-server-address
-      // checks all apply during restoration too.
+      // context. Go through _navigateGuarded() (the same guarded-navigation
+      // core open() uses), rather than calling page.goto() directly, so the
+      // full scheme, resolved-destination, and actual-server-address checks
+      // all apply during restoration too. NOT open() itself: this is a
+      // system-driven restore, not an action any god took, so it must not
+      // write an `open` recorder event attributed to r.god (who didn't
+      // issue this navigation) or spend a per-restore screenshot on it.
       if (r.url && r.url !== 'about:blank') {
         try {
-          await this.open(summary.id, r.url);
+          const s = this.getSession(summary.id);
+          await this._navigateGuarded(s, r.url);
         } catch (_) {
           continue; // one dead/unsafe restored page must not abort the whole relaunch
         }
@@ -536,8 +541,17 @@ class AtlasBrowser {
     }
   }
 
-  async open(id, url) {
-    const s = this.getSession(id);
+  // The actual guarded navigation, with no audit-trail side effects
+  // (screenshot, recorder event) - those belong to a specific caller's
+  // context (which god issued this, for open(); "system restore", not any
+  // god, for _relaunchPreservingSessions()) and must not be fabricated for
+  // a caller that isn't one. Extracted from open() so
+  // _relaunchPreservingSessions() below can restore a session's last URL
+  // through the SAME scheme/destination/server-address checks without
+  // dragging in a per-restore screenshot file and an `open` recorder
+  // event attributed to a god who never issued this navigation - both of
+  // which polluted the audit log before this split existed.
+  async _navigateGuarded(s, url) {
     // HOLE 1 fix: validate the scheme BEFORE goto is ever called. See
     // lib/url-guard.js for why this is boundary validation, not
     // page.route() interception, and why string-prefix matching is not
@@ -581,8 +595,13 @@ class AtlasBrowser {
       await s.page.goto('about:blank').catch(() => {});
       throw err;
     }
+    return { url: s.page.url(), title: await s.page.title() };
+  }
+
+  async open(id, url) {
+    const s = this.getSession(id);
+    const result = await this._navigateGuarded(s, url);
     const shot = await this.screenshotSafe(id, 'open');
-    const result = { url: s.page.url(), title: await s.page.title() };
     s.recorder.log({ type: 'open', god: s.god, url, resultUrl: result.url, title: result.title, screenshot: shot.path });
     return result;
   }
