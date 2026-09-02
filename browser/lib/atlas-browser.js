@@ -171,6 +171,12 @@ class AtlasBrowser {
       // make Chromium write a file to disk at all, regardless of what any
       // future code path does or doesn't call.
       acceptDownloads: false,
+      // Service workers can make requests without going through
+      // BrowserContext.route(), which would leave a hole in the destination
+      // guard installed below. This service does not need visited sites to
+      // retain an offline worker, so block them rather than create an
+      // uninspected outbound-network path.
+      serviceWorkers: 'block',
       viewport: { width: 1280, height: 900 },
       // Proxy/VPN support: `proxy` is undefined (Playwright's
       // own "no proxy" contract) when no profile is active. When a profile
@@ -197,6 +203,25 @@ class AtlasBrowser {
     this.headless = headless;
     this.proxyProfile = proxyProfileName || null;
     this._activeProxyConfig = profile;
+
+    // A top-level navigation check alone does not stop a hostile page from
+    // submitting a form, loading an image, or issuing a no-CORS fetch to an
+    // internal service. Intercept every HTTP(S) request before Chromium sends
+    // it, including subframes and redirect hops, and apply the same resolved-IP
+    // boundary as open(). URL-scheme validation remains in open() as well:
+    // route interception is an additional network boundary, not a substitute
+    // for rejecting non-network schemes before page.goto() sees them.
+    await this.context.route('**/*', async (route) => {
+      const requestUrl = route.request().url();
+      try {
+        assertSafeUrl(requestUrl);
+        await assertSafeDestination(requestUrl);
+        await route.continue();
+      } catch (err) {
+        console.error(`[atlas-browser] SECURITY: blocked request to "${requestUrl}": ${err.message}`);
+        await route.abort('blockedbyclient').catch(() => {});
+      }
+    });
 
     // Apply the JS/DOM-level fingerprint normalization (lib/fingerprint-normalize.js) to every
     // page in this context from here on - addInitScript() runs before any
@@ -345,20 +370,17 @@ class AtlasBrowser {
 
     for (const r of toRestore) {
       const summary = await this.openSession({ god: r.god, label: r.label });
-      // r.url only ever came from a page that was already live in THIS
-      // process (it was read back via page.url(), never caller input), so
-      // this is not the same trust boundary as open()'s `url` argument.
-      // Still runs it through the same guard for defense in depth, so
-      // url-guard.js's "the ONLY place that decides" comment stays true in
-      // practice, not just in the common path.
+      // URLs observed in an existing context are still untrusted at restore
+      // time: DNS can change between the original navigation and this fresh
+      // context. Go through open(), rather than calling page.goto() directly,
+      // so the full scheme, resolved-destination, and actual-server-address
+      // checks all apply during restoration too.
       if (r.url && r.url !== 'about:blank') {
         try {
-          assertSafeUrl(r.url);
+          await this.open(summary.id, r.url);
         } catch (_) {
-          continue; // was already impossible in practice; skip rather than throw mid-restore
+          continue; // one dead/unsafe restored page must not abort the whole relaunch
         }
-        const s = this.getSession(summary.id);
-        await s.page.goto(r.url, { waitUntil: 'domcontentloaded' }).catch(() => {});
       }
     }
 

@@ -161,7 +161,14 @@ def fetch(url, cookies=None):
 
 
 def _flag_val(name):
-    return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else None
+    if name not in sys.argv:
+        return None
+    index = sys.argv.index(name)
+    if index + 1 >= len(sys.argv) or sys.argv[index + 1].startswith("--"):
+        print(f"error: {name} requires a value", file=sys.stderr)
+        print("usage: fetch_media.py <url> [--cookies chrome|safari|firefox]", file=sys.stderr)
+        sys.exit(1)
+    return sys.argv[index + 1]
 
 
 if __name__ == "__main__":
