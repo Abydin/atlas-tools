@@ -51,6 +51,59 @@
 //   node cli.js answer <escalationId> <text>
 //   node cli.js takeover <escalationId>
 
+// Kept in sync with the USAGE block above on purpose - `--help`/`-h`/`help`
+// print exactly this, so there is one source of truth for usage instead of
+// a header comment nobody reads and a separate help string that drifts.
+const HELP_TEXT = `atlas-browser - thin CLI over the atlas-browser HTTP API
+
+Requires the server to already be running: ./start.sh
+(no server yet, or dependencies missing: ./install.sh)
+
+USAGE
+  atlas-browser status
+  atlas-browser sessions                       list all active sessions
+  atlas-browser open <url> [--god NAME] [--label L] [--session ID]
+  atlas-browser read [--session ID]
+  atlas-browser click <selector> [--session ID]
+  atlas-browser type <selector> <text> [--enter] [--session ID]
+  atlas-browser fill <selector> <value> [--session ID]
+  atlas-browser upload <selector> <filePath> [--session ID]
+                                                filePath MUST resolve inside state/uploads/
+  atlas-browser stage-file <path>
+                                                copies a local file into state/uploads/ for upload
+  atlas-browser form-scan [--session ID]       structured description of every field on the page
+  atlas-browser form-set <ref> <value> [--session ID]
+                                                ref comes from form-scan; handles text, select,
+                                                checkbox, radio, and non-native comboboxes
+  atlas-browser form-values [--session ID]     read back what is currently in the fields
+  atlas-browser form-submit <ref> [--wait MS] [--session ID]
+                                                clicks and returns the resulting page, for confirmation
+  atlas-browser close-session [--session ID]
+  atlas-browser save-state
+  atlas-browser watch on|off                   headless:false / headless:true, ALL sessions
+  atlas-browser proxy <name|off>               switch the whole shared context to a named
+                                                proxy/VPN exit profile (state/proxies.json),
+                                                or back to a direct connection. DISCOVERY
+                                                ONLY - see README "Proxy / VPN exit profiles"
+  atlas-browser proxy-check [--session ID]     fetches api.ipify.org through a session to
+                                                show the IP this context is ACTUALLY egressing
+                                                as right now
+  atlas-browser view                           prints the low-tech screenshot fallback URL
+  atlas-browser live                           prints the interactive URL (CDP screencast + real drag)
+  atlas-browser escalate <reason> [--detail D] [--timeout MS] [--session ID]
+                                                BLOCKS until answered/taken-over/timed-out
+  atlas-browser escalations                    list all escalations
+  atlas-browser answer <escalationId> <text>
+  atlas-browser takeover <escalationId>
+  atlas-browser help                           this text (also --help / -h)
+
+Every action operates on a SESSION (a tab). --god NAME (default: atlas)
+reuses that caller's most recently opened session automatically, or pass
+--session ID to target a specific one explicitly.
+
+Full technical detail: README.md in this directory.
+`;
+
 const http = require('http');
 const fs = require('fs');
 const nodePath = require('path');
@@ -103,7 +156,17 @@ function req(method, path, body) {
         });
       }
     );
-    r.on('error', reject);
+    r.on('error', (err) => {
+      // ECONNREFUSED is by far the most common first-run failure: the
+      // server just isn't up yet. Node's raw message ("connect ECONNREFUSED
+      // 127.0.0.1:8781") doesn't say what to do about it, so say so here
+      // rather than leaving that to the user to guess.
+      if (err && err.code === 'ECONNREFUSED') {
+        reject(new Error(`atlas-browser server is not running on 127.0.0.1:${PORT} - start it with ./start.sh (or ./install.sh first if you haven't yet)`));
+        return;
+      }
+      reject(err);
+    });
     if (data) r.write(data);
     r.end();
   });
@@ -152,9 +215,18 @@ async function resolveSessionId(flags) {
 }
 
 async function main() {
-  const { flags, positional } = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  if (argv.includes('--help') || argv.includes('-h') || argv[0] === 'help') {
+    process.stdout.write(HELP_TEXT);
+    process.exit(0);
+    return;
+  }
+  const { flags, positional } = parseArgs(argv);
   const [cmd, ...rest] = positional;
-  if (!cmd) fail('missing command. see cli.js header for usage.');
+  if (!cmd) {
+    process.stdout.write(HELP_TEXT);
+    fail('missing command');
+  }
 
   let result;
   switch (cmd) {

@@ -4,6 +4,12 @@
   "private": false,
   "description": "Headless Playwright browser service with live captcha handover. Headless by default, viewable on demand, never touches the host's own browser profile or desktop. See README.md.",
   "main": "server.js",
+  "bin": {
+    "atlas-browser": "./cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node server.js",
     "test": "node test/smoke.js"

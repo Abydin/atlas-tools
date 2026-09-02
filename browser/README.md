@@ -76,14 +76,37 @@ cli.js  -->  HTTP (127.0.0.1)  -->  server.js  -->  lib/atlas-browser.js  -->  P
 
 ```bash
 cd browser
-npm install
-npx playwright install chromium
+./install.sh
 ./start.sh
+node cli.js status
 ```
+
+`install.sh` checks Node (20+, required), runs `npm install`, and runs
+`npx playwright install chromium` - the actual browser binary Playwright
+drives, a separate ~150MB download most people forget because it isn't an
+npm package. It's idempotent: safe to re-run any time, it skips whatever
+is already in place.
 
 `start.sh` starts the server in the background (default port 8781, logs to
 `logs/server.log`, PID to `state/server.pid`), generating a random bearer
-token on first run at `state/token` (0600). `./stop.sh` stops it.
+token on first run at `state/token` (0600). `./stop.sh` stops it. If the
+browser fails to launch (most commonly, Chromium isn't installed),
+`start.sh` now waits long enough to catch that and prints the last lines
+of `logs/server.log` instead of reporting "started" right before the
+process dies.
+
+To use it as a global command instead of `node cli.js`:
+
+```bash
+npm link            # from browser/, once
+atlas-browser --help
+atlas-browser status
+```
+
+`package.json` declares `atlas-browser` as a `bin` entry pointing at
+`cli.js`, so `npm link` (local) or `npm i -g` (once published) puts
+`atlas-browser` on PATH. It resolves its own directory internally, so it
+works from anywhere, not just from inside `browser/`.
 
 ## Environment variables
 
@@ -195,8 +218,7 @@ server/username/password values, the same as `storageState.json`/`token`.
 
 ```bash
 cd browser
-npm install
-npx playwright install chromium
+./install.sh
 ./start.sh
 node cli.js status
 node cli.js open 'https://example.com'
