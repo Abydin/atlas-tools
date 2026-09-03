@@ -61,6 +61,16 @@
 // future work if this ever needs to be airtight rather than substantially
 // hardened.
 //
+// That post-connect narrowing is NAVIGATION-ONLY. Subresource requests
+// (atlas-browser.js's `context.route()` handler) and WebSocket connections
+// (`context.routeWebSocket()`) call `assertSafeDestination()` alone, with
+// no equivalent post-connect check - Playwright's route/routeWebSocket
+// APIs hand back a request to allow or block before the real connection
+// exists, there is no "here is the address it actually landed on" callback
+// to hook the way `response.serverAddr()` gives `open()` one after
+// `goto()` returns. So the same DNS-rebinding TOCTOU window `open()`
+// partially closes stays fully open for subresources and WebSockets.
+//
 // ESCAPE HATCH: ATLAS_BROWSER_ALLOW_INTERNAL=1, off by default, read fresh
 // on every check (not cached at module load) so it is a deliberate,
 // loudly-logged per-run choice - e.g. legitimately pointing this browser

@@ -171,6 +171,12 @@ class AtlasBrowser {
       // make Chromium write a file to disk at all, regardless of what any
       // future code path does or doesn't call.
       acceptDownloads: false,
+      // Service workers can make requests without going through
+      // BrowserContext.route(), which would leave a hole in the destination
+      // guard installed below. This service does not need visited sites to
+      // retain an offline worker, so block them rather than create an
+      // uninspected outbound-network path.
+      serviceWorkers: 'block',
       viewport: { width: 1280, height: 900 },
       // Proxy/VPN support: `proxy` is undefined (Playwright's
       // own "no proxy" contract) when no profile is active. When a profile
@@ -197,6 +203,51 @@ class AtlasBrowser {
     this.headless = headless;
     this.proxyProfile = proxyProfileName || null;
     this._activeProxyConfig = profile;
+
+    // A top-level navigation check alone does not stop a hostile page from
+    // submitting a form, loading an image, or issuing a no-CORS fetch to an
+    // internal service. Intercept every HTTP(S) request before Chromium sends
+    // it, including subframes and redirect hops, and apply the same resolved-IP
+    // boundary as open(). URL-scheme validation remains in open() as well:
+    // route interception is an additional network boundary, not a substitute
+    // for rejecting non-network schemes before page.goto() sees them.
+    await this.context.route('**/*', async (route) => {
+      const requestUrl = route.request().url();
+      try {
+        assertSafeUrl(requestUrl);
+        await assertSafeDestination(requestUrl);
+        await route.continue();
+      } catch (err) {
+        console.error(`[atlas-browser] SECURITY: blocked request to "${requestUrl}": ${err.message}`);
+        await route.abort('blockedbyclient').catch(() => {});
+      }
+    });
+
+    // HOLE 6: context.route() above only intercepts fetch/XHR/navigation-
+    // style requests - it does NOT see WebSocket connections. Verified
+    // directly: a page opening `new WebSocket('ws://127.0.0.1:<port>/')`
+    // reached a real loopback listener with the route guard above fully
+    // installed and the URL never appeared in the route handler's request
+    // list at all. That is the same SSRF class HOLE 5 closed for HTTP,
+    // still open over ws:/wss:, so it gets its own guard rather than
+    // being folded into the HTTP route above. Same two checks as every
+    // other guarded call site: scheme (assertSafeUrl - ws:/wss: are the
+    // only schemes a WebSocket constructor accepts, so this mostly rejects
+    // a malformed URL) and resolved destination (assertSafeDestination -
+    // the actual SSRF boundary). A blocked socket is closed with 1008
+    // (policy violation) rather than left to mock/hang, so the page's own
+    // onerror/onclose fires promptly instead of looking like a stall.
+    await this.context.routeWebSocket('**/*', async (ws) => {
+      const wsUrl = ws.url();
+      try {
+        assertSafeUrl(wsUrl);
+        await assertSafeDestination(wsUrl);
+        ws.connectToServer();
+      } catch (err) {
+        console.error(`[atlas-browser] SECURITY: blocked WebSocket to "${wsUrl}": ${err.message}`);
+        await ws.close({ code: 1008, reason: 'blocked by atlas-browser SSRF guard' }).catch(() => {});
+      }
+    });
 
     // Apply the JS/DOM-level fingerprint normalization (lib/fingerprint-normalize.js) to every
     // page in this context from here on - addInitScript() runs before any
@@ -345,20 +396,22 @@ class AtlasBrowser {
 
     for (const r of toRestore) {
       const summary = await this.openSession({ god: r.god, label: r.label });
-      // r.url only ever came from a page that was already live in THIS
-      // process (it was read back via page.url(), never caller input), so
-      // this is not the same trust boundary as open()'s `url` argument.
-      // Still runs it through the same guard for defense in depth, so
-      // url-guard.js's "the ONLY place that decides" comment stays true in
-      // practice, not just in the common path.
+      // URLs observed in an existing context are still untrusted at restore
+      // time: DNS can change between the original navigation and this fresh
+      // context. Go through _navigateGuarded() (the same guarded-navigation
+      // core open() uses), rather than calling page.goto() directly, so the
+      // full scheme, resolved-destination, and actual-server-address checks
+      // all apply during restoration too. NOT open() itself: this is a
+      // system-driven restore, not an action any god took, so it must not
+      // write an `open` recorder event attributed to r.god (who didn't
+      // issue this navigation) or spend a per-restore screenshot on it.
       if (r.url && r.url !== 'about:blank') {
         try {
-          assertSafeUrl(r.url);
+          const s = this.getSession(summary.id);
+          await this._navigateGuarded(s, r.url);
         } catch (_) {
-          continue; // was already impossible in practice; skip rather than throw mid-restore
+          continue; // one dead/unsafe restored page must not abort the whole relaunch
         }
-        const s = this.getSession(summary.id);
-        await s.page.goto(r.url, { waitUntil: 'domcontentloaded' }).catch(() => {});
       }
     }
 
@@ -488,8 +541,17 @@ class AtlasBrowser {
     }
   }
 
-  async open(id, url) {
-    const s = this.getSession(id);
+  // The actual guarded navigation, with no audit-trail side effects
+  // (screenshot, recorder event) - those belong to a specific caller's
+  // context (which god issued this, for open(); "system restore", not any
+  // god, for _relaunchPreservingSessions()) and must not be fabricated for
+  // a caller that isn't one. Extracted from open() so
+  // _relaunchPreservingSessions() below can restore a session's last URL
+  // through the SAME scheme/destination/server-address checks without
+  // dragging in a per-restore screenshot file and an `open` recorder
+  // event attributed to a god who never issued this navigation - both of
+  // which polluted the audit log before this split existed.
+  async _navigateGuarded(s, url) {
     // HOLE 1 fix: validate the scheme BEFORE goto is ever called. See
     // lib/url-guard.js for why this is boundary validation, not
     // page.route() interception, and why string-prefix matching is not
@@ -533,8 +595,13 @@ class AtlasBrowser {
       await s.page.goto('about:blank').catch(() => {});
       throw err;
     }
+    return { url: s.page.url(), title: await s.page.title() };
+  }
+
+  async open(id, url) {
+    const s = this.getSession(id);
+    const result = await this._navigateGuarded(s, url);
     const shot = await this.screenshotSafe(id, 'open');
-    const result = { url: s.page.url(), title: await s.page.title() };
     s.recorder.log({ type: 'open', god: s.god, url, resultUrl: result.url, title: result.title, screenshot: shot.path });
     return result;
   }
